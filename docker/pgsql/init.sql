@@ -1,0 +1,3 @@
+-- PostgreSQL 初始化脚本
+-- 表结构已由 database/pgsql/schema.sql 通过 docker-compose volume 挂载提供
+-- 此文件保留为扩展用途 (如插入种子数据)

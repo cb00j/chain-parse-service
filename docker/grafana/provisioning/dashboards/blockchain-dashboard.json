@@ -1,0 +1,75 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "区块链交易监控",
+    "tags": ["blockchain", "transactions"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "交易总数",
+        "type": "stat",
+        "targets": [
+          {
+            "query": "from(bucket: \"blockchain-data\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"transactions\")\n  |> count()",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "事件总数",
+        "type": "stat",
+        "targets": [
+          {
+            "query": "from(bucket: \"blockchain-data\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"business_events\")\n  |> count()",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "每小时交易量",
+        "type": "timeseries",
+        "targets": [
+          {
+            "query": "from(bucket: \"blockchain-data\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"transactions\")\n  |> aggregateWindow(every: 1h, fn: count, createEmpty: false)\n  |> yield(name: \"count\")",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "协议活跃度",
+        "type": "piechart",
+        "targets": [
+          {
+            "query": "from(bucket: \"blockchain-data\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"business_events\")\n  |> group(columns: [\"protocol\"])\n  |> count()",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+      },
+      {
+        "id": 5,
+        "title": "链类型分布",
+        "type": "piechart",
+        "targets": [
+          {
+            "query": "from(bucket: \"blockchain-data\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"transactions\")\n  |> group(columns: [\"chain_type\"])\n  |> count()",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+      }
+    ],
+    "time": {
+      "from": "now-24h",
+      "to": "now"
+    },
+    "refresh": "30s"
+  }
+}

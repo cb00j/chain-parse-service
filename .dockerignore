@@ -1,0 +1,17 @@
+bin/
+out/
+*.test
+*.out
+coverage.*
+.git/
+.github/
+.idea/
+.vscode/
+.cursor/
+.claude/
+.env
+.env.*
+.DS_Store
+docker-compose.override.yml
+openspec/
+vendor/

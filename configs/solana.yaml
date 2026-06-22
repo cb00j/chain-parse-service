@@ -1,0 +1,36 @@
+# Solana 链解析服务配置
+# 继承 base.yaml 的共享配置，仅定义链特定字段
+
+chains:
+  solana:
+    enabled: true
+    rpc_endpoint: "https://api.mainnet-beta.solana.com"
+    chain_id: "solana-mainnet"
+    batch_size: 10
+    timeout: 30
+    retry_count: 3
+
+protocols:
+  pumpfun:
+    enabled: true
+    chain: "solana"
+    program_id: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+  pumpswap:
+    enabled: true
+    chain: "solana"
+    program_id: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+
+quoteAssets:
+  - name: SOL
+    addr: "So11111111111111111111111111111111"
+    rank: 95
+  - name: USDC
+    addr: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    rank: 100
+  - name: USDT
+    addr: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+    rank: 99
+
+storage:
+  influxdb:
+    bucket: "solana"

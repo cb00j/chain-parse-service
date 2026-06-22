@@ -1,0 +1,13 @@
+# Staging 环境配置覆盖
+
+logging:
+  level: "debug"
+  format: "json"
+
+processor:
+  batch_size: 15
+  max_concurrent: 10
+
+api:
+  rate_limit: 200
+  rate_burst: 400

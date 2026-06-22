@@ -1,0 +1,174 @@
+services:
+  # ─── Databases ───────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: chain_parse_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: unified_tx_parser
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../database/pgsql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chain_parse
+
+  mysql:
+    image: mysql:8.0
+    container_name: chain_parse_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-password}
+      MYSQL_DATABASE: unified_tx_parser
+      MYSQL_USER: parser_user
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-parser_pass}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ../database/mysql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/02-init.sql:ro
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+    networks:
+      - chain_parse
+
+  # ─── Cache ──────────────────────────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    container_name: chain_parse_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chain_parse
+
+  # ─── Time Series ────────────────────────────────────────────────────────────
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: chain_parse_influxdb
+    restart: unless-stopped
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_USERNAME:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_PASSWORD:-admin123456}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG:-unified-tx-parser}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET:-blockchain-data}
+      DOCKER_INFLUXDB_INIT_RETENTION: ${INFLUXDB_RETENTION:-90d}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN:-unified-tx-parser-token-2024}
+    ports:
+      - "${INFLUXDB_PORT:-8086}:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+      - ./influxdb/init-buckets.sh:/docker-entrypoint-initdb.d/init-buckets.sh:ro
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chain_parse
+
+  # ─── Monitoring ─────────────────────────────────────────────────────────────
+
+  grafana:
+    image: grafana/grafana:10-alpine
+    container_name: chain_parse_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks:
+      - chain_parse
+
+  # ─── Application ────────────────────────────────────────────────────────────
+
+  parser:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        SERVICE: parser
+    image: chain-parse-parser:latest
+    container_name: chain_parse_parser
+    restart: unless-stopped
+    environment:
+      CHAIN_TYPE: ${CHAIN_TYPE:-bsc}
+    volumes:
+      - ../configs:/app/configs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - chain_parse
+    profiles:
+      - app
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        SERVICE: api
+    image: chain-parse-api:latest
+    container_name: chain_parse_api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8081}:8081"
+    volumes:
+      - ../configs:/app/configs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - chain_parse
+    profiles:
+      - app
+
+volumes:
+  postgres_data:
+  mysql_data:
+  redis_data:
+  influxdb_data:
+  influxdb_config:
+  grafana_data:
+
+networks:
+  chain_parse:
+    driver: bridge

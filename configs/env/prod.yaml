@@ -1,0 +1,27 @@
+# 生产环境配置覆盖
+# 敏感值应通过环境变量注入，此处仅设置非敏感的生产参数
+
+logging:
+  level: "warn"
+  format: "json"
+
+processor:
+  batch_size: 20
+  max_concurrent: 20
+  retry_delay: 10
+  max_retries: 5
+
+storage:
+  pgsql:
+    max_open_conns: 200
+    max_idle_conns: 20
+    conn_max_lifetime: 1800
+
+redis:
+  poolSize: 20
+  maxRetries: 5
+
+api:
+  allow_origins: []
+  rate_limit: 50
+  rate_burst: 100

@@ -1,0 +1,73 @@
+apiVersion: 1
+
+datasources:
+  # 通用InfluxDB数据源（传统单体模式）
+  - name: InfluxDB
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: unified-tx-parser
+      defaultBucket: blockchain-data
+      tlsSkipVerify: true
+    secureJsonData:
+      token: unified-tx-parser-token-2024
+    isDefault: true
+    editable: true
+
+  # Sui链专用数据源
+  - name: InfluxDB-Sui
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: unified-tx-parser
+      defaultBucket: sui
+      tlsSkipVerify: true
+    secureJsonData:
+      token: unified-tx-parser-token-2024
+    editable: true
+
+  # Ethereum链专用数据源
+  - name: InfluxDB-Ethereum
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: unified-tx-parser
+      defaultBucket: ethereum
+      tlsSkipVerify: true
+    secureJsonData:
+      token: unified-tx-parser-token-2024
+    editable: true
+
+  # BSC链专用数据源
+  - name: InfluxDB-BSC
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: unified-tx-parser
+      defaultBucket: bsc
+      tlsSkipVerify: true
+    secureJsonData:
+      token: unified-tx-parser-token-2024
+    editable: true
+
+  # Solana链专用数据源
+  - name: InfluxDB-Solana
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: unified-tx-parser
+      defaultBucket: solana
+      tlsSkipVerify: true
+    secureJsonData:
+      token: unified-tx-parser-token-2024
+    editable: true

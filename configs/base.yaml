@@ -1,0 +1,65 @@
+# 基础配置 - 所有服务和链共享的默认配置
+# 链特定配置文件 (sui.yaml, bsc.yaml 等) 会覆盖此文件中的对应字段
+# 环境变量会覆盖 YAML 配置（见 README）
+
+api:
+  port: 8081
+  read_timeout: 30
+  write_timeout: 30
+  allow_origins:
+    - "*"
+  rate_limit: 100
+  rate_burst: 200
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  db: 0
+  maxRetries: 3
+  poolSize: 10
+
+processor:
+  batch_size: 10
+  max_concurrent: 10
+  retry_delay: 5
+  max_retries: 3
+
+logging:
+  level: "info"
+  format: "text"
+  output: "stdout"
+
+storage:
+  type: "pgsql"
+
+  mysql:
+    host: "localhost"
+    port: 3306
+    username: "parser_user"
+    password: "parser_pass"
+    database: "unified_tx_parser"
+    charset: "utf8mb4"
+    max_open_conns: 100
+    max_idle_conns: 10
+    conn_max_lifetime: 3600
+
+  influxdb:
+    url: "http://localhost:8086"
+    token: "unified-tx-parser-token-2024"
+    org: "unified-tx-parser"
+    bucket: "blockchain-data"
+    batch_size: 1000
+    flush_time: 10
+    precision: "ms"
+
+  pgsql:
+    host: "localhost"
+    port: 5432
+    username: "postgres"
+    password: "password"
+    database: "unified_tx_parser"
+    sslmode: "disable"
+    max_open_conns: 100
+    max_idle_conns: 10
+    conn_max_lifetime: 3600
