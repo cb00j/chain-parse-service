@@ -235,77 +235,28 @@ func (e *EthereumProcessor) getTransactionsFromBlock(ctx context.Context, block 
 	//	blockTxCount = maxTxPerBlock
 	//}
 
-	// 批量获取交易收据 - 使用并发处理
 	receipts := make([]*ethtypes.Receipt, blockTxCount)
 
-	// 并发获取收据
-	type receiptResult struct {
-		index   int
-		receipt *ethtypes.Receipt
-		err     error
-	}
-
-	resultChan := make(chan receiptResult, blockTxCount)
-	//semaphore := make(chan struct{}, 10) // 限制并发数为10
-	//
-	//// 启动goroutines获取收据
-	//for i := 0; i < blockTxCount; i++ {
-	//	go func(index int, tx *ethtypes.Transaction) {
-	//		semaphore <- struct{}{}        // 获取信号量
-	//		defer func() { <-semaphore }() // 释放信号量
-	//
-	//		// 为每个请求设置超时
-	//		receiptCtx, cancel := context.WithTimeout(ctx, time.Second*30)
-	//		defer cancel()
-	//		receipt, err := e.client.TransactionReceipt(receiptCtx, tx.Hash())
-	//		resultChan <- receiptResult{
-	//			index:   index,
-	//			receipt: receipt,
-	//			err:     err,
-	//		}
-	//	}(i, block.Transactions()[i])
-	//}
-
-	e.Log.Infof("++++++++++++++++++++++++++++++start batch processing blockTx %d", blockTxCount)
 	start := time.Now()
 	receiptCtx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
-	err := e.rpcClient.CallContext(receiptCtx, &receipts, "eth_getBlockReceipts", block.Hash().Hex())
-	if err != nil {
-		log.Printf("获取区块 %s 的 Receipts 失败: %v", block.Hash().Hex(), err)
-	}
-	for index, receipt := range receipts {
-		resultChan <- receiptResult{
-			index:   index,
-			receipt: receipt,
-			err:     err,
-		}
-	}
-	e.Log.Infof("++++++++++++++++++++++++++++++finish batch processing blockTx %d,time:%d", blockTxCount, time.Since(start).Milliseconds())
 
-	// 收集结果
-	for i := 0; i < blockTxCount; i++ {
-		result := <-resultChan
-		if result.err != nil {
-			e.Log.Warnf("failed to get transaction receipt (index: %d): %v", result.index, result.err)
+	if err := e.rpcClient.CallContext(receiptCtx, &receipts, "eth_getBlockReceipts", block.Hash().Hex()); err != nil {
+		return nil, fmt.Errorf("eth_getBlockReceipts block %s failed: %w", block.Hash().Hex(), err)
+	}
+	e.Log.Infof("batch receipts: block=%s txs=%d time=%dms",
+		block.Number().String(), blockTxCount, time.Since(start).Milliseconds())
+
+	// 直接转换
+	for i, tx := range block.Transactions() {
+		if i >= len(receipts) || receipts[i] == nil {
 			continue
 		}
-		receipts[result.index] = result.receipt
-	}
-
-	// 转换交易 - 只处理我们实际获取的交易数量
-	for i := 0; i < blockTxCount; i++ {
-		if receipts[i] == nil {
-			continue
-		}
-
-		tx := block.Transactions()[i]
 		unifiedTx, err := e.convertToUnifiedTransaction(tx, receipts[i], block)
 		if err != nil {
-			e.Log.Warnf("failed to convert transaction (hash: %s): %v", tx.Hash().Hex(), err)
+			e.Log.Warnf("convert tx failed (hash: %s): %v", tx.Hash().Hex(), err)
 			continue
 		}
-
 		transactions = append(transactions, *unifiedTx)
 	}
 

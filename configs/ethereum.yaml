@@ -4,12 +4,13 @@
 chains:
   ethereum:
     enabled: true
-    rpc_endpoint: "https://eth.rpc.blxrbdn.com"
+    #rpc_endpoint: "https://mainnet.infura.io/v3/1cc866709fd14a219050c22a15497bef"
+    rpc_endpoint: "https://ethereum-rpc.publicnode.com/d7976886af593e8fbd1628a855655a9730b37ce4581de9376326fc4a63d98953"
     chain_id: "ethereum-mainnet"
-    batch_size: 10
+    batch_size: 5
     timeout: 120
     retry_count: 3
-    start_block: 0
+    start_block: 25398821
 
 protocols:
   uniswap:
@@ -18,22 +19,22 @@ protocols:
     contract_addresses: []
 
 quoteAssets:
-  - name: WETH
-    addr: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-    rank: 95
+#  - name: WETH
+#    addr: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+#    rank: 95
   - name: USDT
     addr: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
     rank: 100
-  - name: USDC
-    addr: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-    rank: 99
-  - name: DAI
-    addr: "0x6B175474E89094C44Da98b954EedeAC495271d0F"
-    rank: 97
+#  - name: USDC
+#    addr: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+#    rank: 99
+#  - name: DAI
+#    addr: "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+#    rank: 97
 
 processor:
-  batch_size: 5
-  max_concurrent: 3
+  batch_size: 1
+  max_concurrent: 1
   retry_delay: 10
   max_retries: 5
 
