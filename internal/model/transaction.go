@@ -4,6 +4,7 @@ import "math/big"
 
 type Transaction struct {
 	Addr        string            `json:"addr"`
+	Protocol    string            `json:"protocol"` // e.g., uniswap_v2 / uniswap_v3
 	Router      string            `json:"router"`
 	Factory     string            `json:"factory"`
 	Pool        string            `json:"pool"`

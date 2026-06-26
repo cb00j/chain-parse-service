@@ -407,9 +407,9 @@ func (p *PgSQLStore) batchInsertDexTransactionsChunk(ctx context.Context, tx *sq
 		return nil
 	}
 
-	const cols = 16
+	const cols = 17
 	var b strings.Builder
-	b.WriteString(`INSERT INTO dex_transactions (addr, router, factory, pool, hash, from_addr, side,
+	b.WriteString(`INSERT INTO dex_transactions (addr, protocol, router, factory, pool, hash, from_addr, side,
 		amount, price, value, time, event_index, tx_index, swap_index, block_number, extra)
 		VALUES `)
 
@@ -419,9 +419,9 @@ func (p *PgSQLStore) batchInsertDexTransactionsChunk(ctx context.Context, tx *sq
 			b.WriteString(",")
 		}
 		base := i * cols
-		fmt.Fprintf(&b, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8,
-			base+9, base+10, base+11, base+12, base+13, base+14, base+15, base+16)
+		fmt.Fprintf(&b, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
+			base+10, base+11, base+12, base+13, base+14, base+15, base+16, base+17)
 
 		var extraJSON *string
 		if dt.Extra != nil {
@@ -430,7 +430,7 @@ func (p *PgSQLStore) batchInsertDexTransactionsChunk(ctx context.Context, tx *sq
 			}
 		}
 		args = append(args,
-			dt.Addr, dt.Router, dt.Factory, dt.Pool, dt.Hash, dt.From, dt.Side,
+			dt.Addr, dt.Protocol, dt.Router, dt.Factory, dt.Pool, dt.Hash, dt.From, dt.Side,
 			utils.BigIntToNullString(dt.Amount), dt.Price, dt.Value, dt.Time,
 			dt.EventIndex, dt.TxIndex, dt.SwapIndex, dt.BlockNumber, extraJSON)
 	}
@@ -510,9 +510,9 @@ func (p *PgSQLStore) batchUpsertReservesChunk(ctx context.Context, tx *sql.Tx, r
 		return nil
 	}
 
-	const cols = 4
+	const cols = 5
 	var b strings.Builder
-	b.WriteString(`INSERT INTO dex_reserves (addr, amount0, amount1, time) VALUES `)
+	b.WriteString(`INSERT INTO dex_reserves (addr, protocol, amount0, amount1, time) VALUES `)
 
 	args := make([]interface{}, 0, len(reserves)*cols)
 	for i, res := range reserves {
@@ -520,8 +520,8 @@ func (p *PgSQLStore) batchUpsertReservesChunk(ctx context.Context, tx *sql.Tx, r
 			b.WriteString(",")
 		}
 		base := i * cols
-		fmt.Fprintf(&b, "($%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4)
+		fmt.Fprintf(&b, "($%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5)
 
 		var a0, a1 string
 		if v, ok := res.Amounts[0]; ok && v != nil {
@@ -530,11 +530,11 @@ func (p *PgSQLStore) batchUpsertReservesChunk(ctx context.Context, tx *sql.Tx, r
 		if v, ok := res.Amounts[1]; ok && v != nil {
 			a1 = v.String()
 		}
-		args = append(args, res.Addr, a0, a1, res.Time)
+		args = append(args, res.Addr, res.Protocol, a0, a1, res.Time)
 	}
 
 	b.WriteString(` ON CONFLICT (addr, time) DO UPDATE SET
-		amount0=EXCLUDED.amount0, amount1=EXCLUDED.amount1`)
+		protocol=EXCLUDED.protocol, amount0=EXCLUDED.amount0, amount1=EXCLUDED.amount1`)
 
 	_, err := tx.ExecContext(ctx, b.String(), args...)
 	return err

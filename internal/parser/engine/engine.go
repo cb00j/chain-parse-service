@@ -300,6 +300,22 @@ func (e *Engine) processChainBatch(chainType types.ChainType, processor types.Ch
 	log.Infof("storing data...")
 	storeStartTime := time.Now()
 
+	// 存储区块元数据(链无关:chain_type/chain_id 已在 UnifiedBlock 内)
+	if err := e.storage.StoreBlocks(e.ctx, blocks); err != nil {
+		return fmt.Errorf("存储区块数据失败: %w", err)
+	}
+
+	// 存储原始交易(从各区块展开;dex_transactions.hash 可据此跨表关联)
+	allTxs := make([]types.UnifiedTransaction, 0)
+	for _, block := range blocks {
+		allTxs = append(allTxs, block.Transactions...)
+	}
+	if len(allTxs) > 0 {
+		if err := e.storage.StoreTransactions(e.ctx, allTxs); err != nil {
+			return fmt.Errorf("存储交易数据失败: %w", err)
+		}
+	}
+
 	// 存储DEX数据
 	if totalDexRecords > 0 {
 		if err := e.storage.StoreDexData(e.ctx, dexData); err != nil {

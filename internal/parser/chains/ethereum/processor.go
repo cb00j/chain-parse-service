@@ -229,11 +229,11 @@ func (e *EthereumProcessor) getTransactionsFromBlock(ctx context.Context, block 
 	e.Log.Infof("processing block %s, %d transactions", block.Number().String(), blockTxCount)
 
 	// 如果交易数量太多，限制处理数量以避免超时
-	maxTxPerBlock := 100
-	if blockTxCount > maxTxPerBlock {
-		e.Log.Warnf("too many transactions in block (%d), limiting to %d", blockTxCount, maxTxPerBlock)
-		blockTxCount = maxTxPerBlock
-	}
+	//maxTxPerBlock := 100
+	//if blockTxCount > maxTxPerBlock {
+	//	e.Log.Warnf("too many transactions in block (%d), limiting to %d", blockTxCount, maxTxPerBlock)
+	//	blockTxCount = maxTxPerBlock
+	//}
 
 	// 批量获取交易收据 - 使用并发处理
 	receipts := make([]*ethtypes.Receipt, blockTxCount)
@@ -246,31 +246,42 @@ func (e *EthereumProcessor) getTransactionsFromBlock(ctx context.Context, block 
 	}
 
 	resultChan := make(chan receiptResult, blockTxCount)
-	semaphore := make(chan struct{}, 10) // 限制并发数为10
+	//semaphore := make(chan struct{}, 10) // 限制并发数为10
+	//
+	//// 启动goroutines获取收据
+	//for i := 0; i < blockTxCount; i++ {
+	//	go func(index int, tx *ethtypes.Transaction) {
+	//		semaphore <- struct{}{}        // 获取信号量
+	//		defer func() { <-semaphore }() // 释放信号量
+	//
+	//		// 为每个请求设置超时
+	//		receiptCtx, cancel := context.WithTimeout(ctx, time.Second*30)
+	//		defer cancel()
+	//		receipt, err := e.client.TransactionReceipt(receiptCtx, tx.Hash())
+	//		resultChan <- receiptResult{
+	//			index:   index,
+	//			receipt: receipt,
+	//			err:     err,
+	//		}
+	//	}(i, block.Transactions()[i])
+	//}
 
-	// 启动goroutines获取收据
-	for i := 0; i < blockTxCount; i++ {
-		go func(index int, tx *ethtypes.Transaction) {
-			semaphore <- struct{}{}        // 获取信号量
-			defer func() { <-semaphore }() // 释放信号量
-
-			// 为每个请求设置超时
-			receiptCtx, cancel := context.WithTimeout(ctx, time.Second*30)
-			defer cancel()
-
-			receipt, err := e.client.TransactionReceipt(receiptCtx, tx.Hash())
-			//var receipts []*ethtypes.Receipt
-			//err := e.rpcClient.CallContext(receiptCtx, &receipts, "eth_getBlockReceipts", block.Hash().Hex())
-			//if err != nil {
-			//	log.Printf("获取区块 %s 的 Receipts 失败: %v", block.Hash().Hex(), err)
-			//}
-			resultChan <- receiptResult{
-				index:   index,
-				receipt: receipt,
-				err:     err,
-			}
-		}(i, block.Transactions()[i])
+	e.Log.Infof("++++++++++++++++++++++++++++++start batch processing blockTx %d", blockTxCount)
+	start := time.Now()
+	receiptCtx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
+	err := e.rpcClient.CallContext(receiptCtx, &receipts, "eth_getBlockReceipts", block.Hash().Hex())
+	if err != nil {
+		log.Printf("获取区块 %s 的 Receipts 失败: %v", block.Hash().Hex(), err)
 	}
+	for index, receipt := range receipts {
+		resultChan <- receiptResult{
+			index:   index,
+			receipt: receipt,
+			err:     err,
+		}
+	}
+	e.Log.Infof("++++++++++++++++++++++++++++++finish batch processing blockTx %d,time:%d", blockTxCount, time.Since(start).Milliseconds())
 
 	// 收集结果
 	for i := 0; i < blockTxCount; i++ {

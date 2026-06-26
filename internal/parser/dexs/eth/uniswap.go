@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"unified-tx-parser/internal/model"
 	dex "unified-tx-parser/internal/parser/dexs"
@@ -27,6 +28,7 @@ const (
 	burnV2EventSig      = "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496"
 	mintV3EventSig      = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"
 	burnV3EventSig      = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c"
+	syncV2EventSig      = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
 	pairCreatedEventSig = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
 	poolCreatedEventSig = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"
 )
@@ -34,6 +36,10 @@ const (
 // UniswapExtractor parses Uniswap V2/V3 DEX events on Ethereum and BSC.
 type UniswapExtractor struct {
 	*dex.EVMDexExtractor
+	// seenPools 记录已产出过 Pool 记录的池子地址,避免每笔 swap 都重复产出。
+	// extractor 实例常驻内存(factory 里只 new 一次),所以跨批次有效。
+	// 使用 sync.Map 保证并发安全。
+	seenPools sync.Map
 }
 
 // NewUniswapExtractor creates a Uniswap extractor with EVM base class.
@@ -88,10 +94,19 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 						dexData.Transactions = append(dexData.Transactions, *modelTx)
 						swapIdx++
 					}
+					if pool := u.lazyPool(log.Address.Hex(), uniswapV2FactoryAddr, "uniswap_v2", &tx); pool != nil {
+						dexData.Pools = append(dexData.Pools, *pool)
+					}
 				case "swap_v3":
 					if modelTx := u.parseV3Swap(log, &tx, eventIndex, swapIdx); modelTx != nil {
 						dexData.Transactions = append(dexData.Transactions, *modelTx)
 						swapIdx++
+					}
+					if reserve := u.parseV3Reserve(log, &tx); reserve != nil {
+						dexData.Reserves = append(dexData.Reserves, *reserve)
+					}
+					if pool := u.lazyPool(log.Address.Hex(), uniswapV3FactoryAddr, "uniswap_v3", &tx); pool != nil {
+						dexData.Pools = append(dexData.Pools, *pool)
 					}
 				case "mint":
 					if liq := u.parseLiquidity(log, &tx, "add", eventIndex); liq != nil {
@@ -100,6 +115,10 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 				case "burn":
 					if liq := u.parseLiquidity(log, &tx, "remove", eventIndex); liq != nil {
 						dexData.Liquidities = append(dexData.Liquidities, *liq)
+					}
+				case "sync":
+					if reserve := u.parseSync(log, &tx); reserve != nil {
+						dexData.Reserves = append(dexData.Reserves, *reserve)
 					}
 				case "pair_created":
 					if pool := u.parseV2PairCreated(log, &tx); pool != nil {
@@ -143,6 +162,7 @@ func (u *UniswapExtractor) isUniswapLog(log *ethtypes.Log) bool {
 		topic0 == burnV2EventSig ||
 		topic0 == mintV3EventSig ||
 		topic0 == burnV3EventSig ||
+		topic0 == syncV2EventSig ||
 		topic0 == pairCreatedEventSig ||
 		topic0 == poolCreatedEventSig
 }
@@ -161,12 +181,37 @@ func (u *UniswapExtractor) getLogType(log *ethtypes.Log) string {
 		return "mint"
 	case burnV2EventSig, burnV3EventSig:
 		return "burn"
+	case syncV2EventSig:
+		return "sync"
 	case pairCreatedEventSig:
 		return "pair_created"
 	case poolCreatedEventSig:
 		return "pool_created"
 	default:
 		return ""
+	}
+}
+
+// lazyPool 在 seenPools 缓存里没有这个地址时,产出一条最小 Pool 记录并缓存。
+// Swap 日志里拿不到 token0/token1 地址(只有 PairCreated/PoolCreated 才有),
+// 所以 Tokens 留空——表达「池子存在」已够做协议/factory 维度的统计。
+// 等后续扫到建池事件或补全 token 元数据时,存储层的 upsert 会覆盖补全。
+func (u *UniswapExtractor) lazyPool(poolAddr, factory, protocol string, tx *types.UnifiedTransaction) *model.Pool {
+	if _, loaded := u.seenPools.LoadOrStore(poolAddr, struct{}{}); loaded {
+		// 已产出过,本批次无需再产出
+		return nil
+	}
+	return &model.Pool{
+		Addr:     poolAddr,
+		Factory:  factory,
+		Protocol: protocol,
+		Tokens:   map[int]string{}, // token 地址待建池事件或 token 解析时回填
+		Fee:      0,                // 费率待建池事件回填
+		Extra: &model.PoolExtra{
+			Hash: tx.TxHash,
+			From: tx.FromAddress,
+			Time: uint64(tx.Timestamp.Unix()),
+		},
 	}
 }
 
@@ -199,6 +244,7 @@ func (u *UniswapExtractor) parseV2Swap(log *ethtypes.Log, tx *types.UnifiedTrans
 		Addr:        poolAddr,
 		Router:      tx.ToAddress,
 		Factory:     uniswapV2FactoryAddr,
+		Protocol:    "uniswap_v2",
 		Pool:        poolAddr,
 		Hash:        tx.TxHash,
 		From:        tx.FromAddress,
@@ -212,8 +258,8 @@ func (u *UniswapExtractor) parseV2Swap(log *ethtypes.Log, tx *types.UnifiedTrans
 		SwapIndex:   swapIdx,
 		BlockNumber: dex.GetBlockNumber(tx),
 		Extra: &model.TransactionExtra{
-			QuotePrice:    fmt.Sprintf("%.18f", price),
-			Type:          "swap",
+			QuotePrice: fmt.Sprintf("%.18f", price),
+			Type:       "swap",
 		},
 	}
 }
@@ -247,6 +293,7 @@ func (u *UniswapExtractor) parseV3Swap(log *ethtypes.Log, tx *types.UnifiedTrans
 		Addr:        poolAddr,
 		Router:      tx.ToAddress,
 		Factory:     uniswapV3FactoryAddr,
+		Protocol:    "uniswap_v3",
 		Pool:        poolAddr,
 		Hash:        tx.TxHash,
 		From:        tx.FromAddress,
@@ -260,8 +307,8 @@ func (u *UniswapExtractor) parseV3Swap(log *ethtypes.Log, tx *types.UnifiedTrans
 		SwapIndex:   swapIdx,
 		BlockNumber: dex.GetBlockNumber(tx),
 		Extra: &model.TransactionExtra{
-			QuotePrice:    fmt.Sprintf("%.18f", price),
-			Type:          "swap",
+			QuotePrice: fmt.Sprintf("%.18f", price),
+			Type:       "swap",
 		},
 	}
 }
@@ -326,6 +373,72 @@ func (u *UniswapExtractor) parseLiquidity(log *ethtypes.Log, tx *types.UnifiedTr
 			Values:  []float64{val0, val1},
 			Time:    uint64(tx.Timestamp.Unix()),
 		},
+	}
+}
+
+// parseSync parses V2 Sync(uint112 reserve0, uint112 reserve1) into a pool reserve snapshot.
+// Sync is emitted by the pair contract itself, so log.Address is the pool address.
+// Note: Uniswap V3 does not emit Sync (concentrated liquidity), so this only covers V2 pools.
+func (u *UniswapExtractor) parseSync(log *ethtypes.Log, tx *types.UnifiedTransaction) *model.Reserve {
+	if len(log.Data) < 64 {
+		return nil
+	}
+
+	// Both reserves are non-indexed uint112, right-aligned in 32-byte words.
+	reserve0 := new(big.Int).SetBytes(log.Data[0:32])
+	reserve1 := new(big.Int).SetBytes(log.Data[32:64])
+
+	return &model.Reserve{
+		Addr:     log.Address.Hex(),
+		Protocol: "uniswap_v2",
+		Amounts: map[int]*big.Int{
+			0: reserve0,
+			1: reserve1,
+		},
+		Time: uint64(tx.Timestamp.Unix()),
+	}
+}
+
+// parseV3Reserve derives virtual reserves at the current price from a V3 Swap event.
+// V3 has no Sync event and no global reserve pair; around the current tick a V3 pool
+// behaves like a V2 pool with:
+//
+//	x (token0) = L * 2^96 / sqrtPriceX96
+//	y (token1) = L * sqrtPriceX96 / 2^96
+//
+// where L is the active in-range liquidity and sqrtPriceX96 = sqrt(price) * 2^96.
+// These are the virtual reserves backing the current price (depth at the current tick),
+// NOT the pool's total token balances. No extra RPC is needed: both fields are already
+// in the Swap log (data[64:96] = sqrtPriceX96, data[96:128] = liquidity).
+func (u *UniswapExtractor) parseV3Reserve(log *ethtypes.Log, tx *types.UnifiedTransaction) *model.Reserve {
+	if len(log.Data) < 160 {
+		return nil
+	}
+
+	sqrtPriceX96 := new(big.Int).SetBytes(log.Data[64:96])
+	liquidity := new(big.Int).SetBytes(log.Data[96:128])
+	if sqrtPriceX96.Sign() == 0 || liquidity.Sign() == 0 {
+		return nil
+	}
+
+	q96 := new(big.Int).Lsh(big.NewInt(1), 96) // 2^96
+
+	// x (token0) = L * 2^96 / sqrtPriceX96
+	amount0 := new(big.Int).Mul(liquidity, q96)
+	amount0.Quo(amount0, sqrtPriceX96)
+
+	// y (token1) = L * sqrtPriceX96 / 2^96
+	amount1 := new(big.Int).Mul(liquidity, sqrtPriceX96)
+	amount1.Rsh(amount1, 96)
+
+	return &model.Reserve{
+		Addr:     log.Address.Hex(),
+		Protocol: "uniswap_v3",
+		Amounts: map[int]*big.Int{
+			0: amount0,
+			1: amount1,
+		},
+		Time: uint64(tx.Timestamp.Unix()),
 	}
 }
 

@@ -6,9 +6,9 @@
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS blocks (
-    id BIGSERIAL PRIMARY KEY,
-    block_number BIGINT NOT NULL,
-    block_hash VARCHAR(128) NOT NULL,
+                                      id BIGSERIAL PRIMARY KEY,
+                                      block_number BIGINT NOT NULL,
+                                      block_hash VARCHAR(128) NOT NULL,
     chain_type VARCHAR(32) NOT NULL,
     chain_id VARCHAR(64) NOT NULL,
     parent_hash VARCHAR(128),
@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     UNIQUE (block_hash, chain_type)
-);
+    );
 
 CREATE INDEX IF NOT EXISTS idx_blocks_chain_number ON blocks (chain_type, block_number);
 CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks (timestamp);
@@ -28,8 +28,8 @@ CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks (timestamp);
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS transactions (
-    id BIGSERIAL PRIMARY KEY,
-    tx_hash VARCHAR(128) NOT NULL,
+                                            id BIGSERIAL PRIMARY KEY,
+                                            tx_hash VARCHAR(128) NOT NULL,
     chain_type VARCHAR(32) NOT NULL,
     chain_id VARCHAR(64) NOT NULL,
     block_number BIGINT,
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     UNIQUE (tx_hash, chain_type)
-);
+    );
 
 CREATE INDEX IF NOT EXISTS idx_ut_chain_block ON transactions (chain_type, block_number);
 CREATE INDEX IF NOT EXISTS idx_ut_timestamp ON transactions (timestamp);
@@ -59,21 +59,21 @@ CREATE INDEX IF NOT EXISTS idx_ut_to_address ON transactions (to_address);
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS processing_progress (
-    chain_type VARCHAR(32) PRIMARY KEY,
+                                                   chain_type VARCHAR(32) PRIMARY KEY,
     last_processed_block BIGINT NOT NULL DEFAULT 0,
     last_update_time TIMESTAMP,
     total_transactions BIGINT DEFAULT 0,
     total_events BIGINT DEFAULT 0,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
-);
+    );
 
 -- ============================================================
 -- DEX 池子表
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS dex_pools (
-    addr VARCHAR(256) PRIMARY KEY,
+                                         addr VARCHAR(256) PRIMARY KEY,
     factory VARCHAR(256) NOT NULL,
     protocol VARCHAR(64) NOT NULL,
     token0 VARCHAR(256),
@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS dex_pools (
     extra JSONB,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
-);
+    );
 
 CREATE INDEX IF NOT EXISTS idx_dp_protocol ON dex_pools (protocol);
 CREATE INDEX IF NOT EXISTS idx_dp_factory ON dex_pools (factory);
@@ -92,22 +92,23 @@ CREATE INDEX IF NOT EXISTS idx_dp_factory ON dex_pools (factory);
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS dex_tokens (
-    addr VARCHAR(256) PRIMARY KEY,
+                                          addr VARCHAR(256) PRIMARY KEY,
     name VARCHAR(128),
     symbol VARCHAR(64),
     decimals INT DEFAULT 0,
     is_stable BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
-);
+    );
 
 -- ============================================================
 -- DEX 交易表
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS dex_transactions (
-    id BIGSERIAL PRIMARY KEY,
-    addr VARCHAR(256) NOT NULL,
+                                                id BIGSERIAL PRIMARY KEY,
+                                                addr VARCHAR(256) NOT NULL,
+    protocol VARCHAR(64),
     router VARCHAR(256),
     factory VARCHAR(256),
     pool VARCHAR(256) NOT NULL,
@@ -125,7 +126,7 @@ CREATE TABLE IF NOT EXISTS dex_transactions (
     extra JSONB,
     created_at TIMESTAMP DEFAULT NOW(),
     UNIQUE (hash, event_index, side)
-);
+    );
 
 CREATE INDEX IF NOT EXISTS idx_dt_pool ON dex_transactions (pool);
 CREATE INDEX IF NOT EXISTS idx_dt_time ON dex_transactions (time);
@@ -136,8 +137,8 @@ CREATE INDEX IF NOT EXISTS idx_dt_block ON dex_transactions (block_number);
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS dex_liquidities (
-    id BIGSERIAL PRIMARY KEY,
-    addr VARCHAR(256) NOT NULL,
+                                               id BIGSERIAL PRIMARY KEY,
+                                               addr VARCHAR(256) NOT NULL,
     router VARCHAR(256),
     factory VARCHAR(256),
     pool VARCHAR(256) NOT NULL,
@@ -152,7 +153,7 @@ CREATE TABLE IF NOT EXISTS dex_liquidities (
     extra JSONB,
     created_at TIMESTAMP DEFAULT NOW(),
     UNIQUE (key, addr)
-);
+    );
 
 CREATE INDEX IF NOT EXISTS idx_dl_pool ON dex_liquidities (pool);
 CREATE INDEX IF NOT EXISTS idx_dl_time ON dex_liquidities (time);
@@ -162,13 +163,14 @@ CREATE INDEX IF NOT EXISTS idx_dl_time ON dex_liquidities (time);
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS dex_reserves (
-    id BIGSERIAL PRIMARY KEY,
-    addr VARCHAR(256) NOT NULL,
+                                            id BIGSERIAL PRIMARY KEY,
+                                            addr VARCHAR(256) NOT NULL,
+    protocol VARCHAR(64),
     amount0 NUMERIC(78, 0),
     amount1 NUMERIC(78, 0),
     time BIGINT NOT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
     UNIQUE (addr, time)
-);
+    );
 
 CREATE INDEX IF NOT EXISTS idx_dr_time ON dex_reserves (time);

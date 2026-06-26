@@ -383,16 +383,16 @@ func (m *MySQLStore) batchInsertDexTransactionsChunk(ctx context.Context, tx *sq
 	}
 
 	var b strings.Builder
-	b.WriteString(`INSERT IGNORE INTO dex_transactions (addr, router, factory, pool, hash, from_addr, side,
+	b.WriteString(`INSERT IGNORE INTO dex_transactions (addr, protocol, router, factory, pool, hash, from_addr, side,
 		amount, price, value, time, event_index, tx_index, swap_index, block_number, extra)
 		VALUES `)
 
-	args := make([]interface{}, 0, len(dexTxs)*16)
+	args := make([]interface{}, 0, len(dexTxs)*17)
 	for i, dt := range dexTxs {
 		if i > 0 {
 			b.WriteString(",")
 		}
-		b.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		b.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 
 		var extraJSON *string
 		if dt.Extra != nil {
@@ -401,7 +401,7 @@ func (m *MySQLStore) batchInsertDexTransactionsChunk(ctx context.Context, tx *sq
 			}
 		}
 		args = append(args,
-			dt.Addr, dt.Router, dt.Factory, dt.Pool, dt.Hash, dt.From, dt.Side,
+			dt.Addr, dt.Protocol, dt.Router, dt.Factory, dt.Pool, dt.Hash, dt.From, dt.Side,
 			utils.BigIntToNullString(dt.Amount), dt.Price, dt.Value, dt.Time,
 			dt.EventIndex, dt.TxIndex, dt.SwapIndex, dt.BlockNumber, extraJSON)
 	}
@@ -473,14 +473,14 @@ func (m *MySQLStore) batchUpsertReservesChunk(ctx context.Context, tx *sql.Tx, r
 	}
 
 	var b strings.Builder
-	b.WriteString(`INSERT INTO dex_reserves (addr, amount0, amount1, time) VALUES `)
+	b.WriteString(`INSERT INTO dex_reserves (addr, protocol, amount0, amount1, time) VALUES `)
 
-	args := make([]interface{}, 0, len(reserves)*4)
+	args := make([]interface{}, 0, len(reserves)*5)
 	for i, res := range reserves {
 		if i > 0 {
 			b.WriteString(",")
 		}
-		b.WriteString("(?,?,?,?)")
+		b.WriteString("(?,?,?,?,?)")
 
 		var a0, a1 string
 		if v, ok := res.Amounts[0]; ok && v != nil {
@@ -489,11 +489,11 @@ func (m *MySQLStore) batchUpsertReservesChunk(ctx context.Context, tx *sql.Tx, r
 		if v, ok := res.Amounts[1]; ok && v != nil {
 			a1 = v.String()
 		}
-		args = append(args, res.Addr, a0, a1, res.Time)
+		args = append(args, res.Addr, res.Protocol, a0, a1, res.Time)
 	}
 
 	b.WriteString(` ON DUPLICATE KEY UPDATE
-		amount0=VALUES(amount0), amount1=VALUES(amount1)`)
+		protocol=VALUES(protocol), amount0=VALUES(amount0), amount1=VALUES(amount1)`)
 
 	_, err := tx.ExecContext(ctx, b.String(), args...)
 	return err

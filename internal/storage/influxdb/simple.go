@@ -535,7 +535,8 @@ func (s *SimpleInfluxDBStorage) upsertReserve(ctx context.Context, reserve model
 	}
 
 	tags := map[string]string{
-		"addr": reserve.Addr,
+		"addr":     reserve.Addr,
+		"protocol": reserve.Protocol,
 	}
 
 	fields := map[string]interface{}{
@@ -574,13 +575,14 @@ func (s *SimpleInfluxDBStorage) upsertReserve(ctx context.Context, reserve model
 // insertTransaction 直接插入交易数据
 func (s *SimpleInfluxDBStorage) insertTransaction(ctx context.Context, tx model.Transaction) error {
 	tags := map[string]string{
-		"addr":    tx.Addr,
-		"hash":    tx.Hash,
-		"from":    tx.From,
-		"side":    tx.Side,
-		"pool":    tx.Pool,
-		"router":  tx.Router,
-		"factory": tx.Factory,
+		"addr":     tx.Addr,
+		"hash":     tx.Hash,
+		"from":     tx.From,
+		"side":     tx.Side,
+		"pool":     tx.Pool,
+		"router":   tx.Router,
+		"factory":  tx.Factory,
+		"protocol": tx.Protocol,
 	}
 
 	fields := map[string]interface{}{
