@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/sirupsen/logrus"
 )
 
@@ -21,9 +22,10 @@ var log = logrus.WithFields(logrus.Fields{"service": "parser", "module": "chain-
 // EthereumProcessor 以太坊链处理器
 type EthereumProcessor struct {
 	base.Processor
-	client  *ethclient.Client
-	chainID *big.Int
-	config  *EthereumConfig
+	rpcClient *rpc.Client       // 用于发送底层的、自定义的 RPC 请求
+	client    *ethclient.Client // 用于发送标准封装好的请求
+	chainID   *big.Int
+	config    *EthereumConfig
 }
 
 // EthereumConfig 以太坊链配置
@@ -46,14 +48,16 @@ func NewEthereumProcessor(config *EthereumConfig) (*EthereumProcessor, error) {
 	}
 
 	// 创建以太坊客户端
-	client, err := ethclient.Dial(config.RPCEndpoint)
+	rpcClient, err := rpc.Dial(config.RPCEndpoint)
+	//client, err := ethclient.Dial(config.RPCEndpoint)
 	if err != nil {
 		return nil, fmt.Errorf("连接以太坊节点失败: %w", err)
 	}
 
 	processor := &EthereumProcessor{
 		Processor: base.NewProcessor(types.ChainTypeEthereum, config.RPCEndpoint, config.BatchSize),
-		client:    client,
+		rpcClient: rpcClient,
+		client:    ethclient.NewClient(rpcClient), // 将底层的 rpc.Client 包装成标准的 ethclient.Client
 		chainID:   big.NewInt(config.ChainID),
 		config:    config,
 	}
@@ -255,6 +259,11 @@ func (e *EthereumProcessor) getTransactionsFromBlock(ctx context.Context, block 
 			defer cancel()
 
 			receipt, err := e.client.TransactionReceipt(receiptCtx, tx.Hash())
+			//var receipts []*ethtypes.Receipt
+			//err := e.rpcClient.CallContext(receiptCtx, &receipts, "eth_getBlockReceipts", block.Hash().Hex())
+			//if err != nil {
+			//	log.Printf("获取区块 %s 的 Receipts 失败: %v", block.Hash().Hex(), err)
+			//}
 			resultChan <- receiptResult{
 				index:   index,
 				receipt: receipt,

@@ -1,0 +1,65 @@
+# 基础配置 - 所有服务和链共享的默认配置
+# 链特定配置文件 (sui.yaml, bsc.yaml 等) 会覆盖此文件中的对应字段
+# 环境变量会覆盖 YAML 配置（见 README）
+
+api:
+  port: 8081
+  read_timeout: 30
+  write_timeout: 30
+  allow_origins:
+    - "*"
+  rate_limit: 100
+  rate_burst: 200
+
+redis:
+  host: "192.168.5.5"
+  port: 6379
+  password: ""
+  db: 0
+  maxRetries: 3
+  poolSize: 10
+
+processor:
+  batch_size: 5
+  max_concurrent: 1
+  retry_delay: 5
+  max_retries: 3
+
+logging:
+  level: "info"
+  format: "text"
+  output: "stdout"
+
+storage:
+  type: "influxdb"
+
+  mysql:
+    host: "192.168.5.5"
+    port: 3306
+    username: "root"
+    password: "CBJzst564773776*"
+    database: "unified_tx_parser"
+    charset: "utf8mb4"
+    max_open_conns: 100
+    max_idle_conns: 10
+    conn_max_lifetime: 3600
+
+  influxdb:
+    url: "http://192.168.5.73:8086"
+    token: "MOKz2AOnnk6UjTJu_7XHYwTxVsCjBqz5UFUxDV64xi0I8Ekos-N9-XXhzk7-3E5AeF245iMLFo1JxIFnoR6Srg=="
+    org: "unified-tx-parser"
+    bucket: "blockchain-data"
+    batch_size: 1000
+    flush_time: 10
+    precision: "ms"
+
+  pgsql:
+    host: "localhost"
+    port: 5432
+    username: "postgres"
+    password: "password"
+    database: "unified_tx_parser"
+    sslmode: "disable"
+    max_open_conns: 100
+    max_idle_conns: 10
+    conn_max_lifetime: 3600

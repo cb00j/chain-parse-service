@@ -38,8 +38,8 @@ type QuoteAssetConfig struct {
 
 // Config 应用配置
 type Config struct {
-	API   APIConfig  `yaml:"api"`
-	Redis RedisConfig `yaml:"redis"`
+	API         APIConfig                 `yaml:"api"`
+	Redis       RedisConfig               `yaml:"redis"`
 	Chains      map[string]ChainConfig    `yaml:"chains"`
 	Protocols   map[string]ProtocolConfig `yaml:"protocols"`
 	Processor   ProcessorConfig           `yaml:"processor"`
@@ -219,7 +219,7 @@ func LoadChainConfig(chainType string) (*Config, error) {
 // loadBaseConfig loads configs/base.yaml if it exists, otherwise returns an empty config.
 func loadBaseConfig(configDir string) (*Config, error) {
 	config := &Config{}
-	basePath := filepath.Join(configDir, "base.yaml")
+	basePath := filepath.Join(configDir, "my_base.yaml")
 	if _, err := os.Stat(basePath); err == nil {
 		if err := mergeFromFile(config, basePath); err != nil {
 			return nil, fmt.Errorf("loading base config: %w", err)
@@ -537,7 +537,6 @@ func resolveConfigPath(configPath string) string {
 	}
 	return configPath
 }
-
 
 // Validate checks required fields and value ranges.
 func (c *Config) Validate() error {

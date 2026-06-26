@@ -539,7 +539,7 @@ func (s *SimpleInfluxDBStorage) upsertReserve(ctx context.Context, reserve model
 	}
 
 	fields := map[string]interface{}{
-		"time": reserve.Time,
+		"event_time": reserve.Time,
 	}
 
 	// 添加金额信息
@@ -587,7 +587,7 @@ func (s *SimpleInfluxDBStorage) insertTransaction(ctx context.Context, tx model.
 		"amount":       tx.Amount.String(),
 		"price":        tx.Price,
 		"value":        tx.Value,
-		"time":         tx.Time,
+		"event_time":   tx.Time,
 		"event_index":  tx.EventIndex,
 		"tx_index":     tx.TxIndex,
 		"swap_index":   tx.SwapIndex,
@@ -623,7 +623,7 @@ func (s *SimpleInfluxDBStorage) insertLiquidity(ctx context.Context, liquidity m
 	fields := map[string]interface{}{
 		"amount":      liquidity.Amount.String(),
 		"value":       liquidity.Value,
-		"time":        liquidity.Time,
+		"event_time":  liquidity.Time,
 		"created":     true,
 		"create_time": time.Now().Unix(),
 	}
