@@ -4,16 +4,23 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
-	redisTracker "unified-tx-parser/internal/storage/progress/redis"
+	"time"
 
 	"unified-tx-parser/internal/config"
 	"unified-tx-parser/internal/storage/influxdb"
 	"unified-tx-parser/internal/storage/mysql"
 	"unified-tx-parser/internal/storage/pgsql"
+	dbTracker "unified-tx-parser/internal/storage/progress/db"
+	fallbackTracker "unified-tx-parser/internal/storage/progress/fallback"
+	redisTracker "unified-tx-parser/internal/storage/progress/redis"
 	"unified-tx-parser/internal/types"
 
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
+	log "github.com/sirupsen/logrus"
 )
 
 // CreateStorageEngine creates a storage engine based on the config storage type.
@@ -62,10 +69,21 @@ func CreateStorageEngine(cfg *config.Config) (types.StorageEngine, error) {
 	}
 }
 
-// CreateProgressTracker creates a Redis-backed progress tracker.
-// Returns the tracker, the underlying Redis client (for cleanup), and any error.
+// CreateProgressTracker creates a FallbackProgressTracker:
+//   - primary:   Redis (fast, real-time)
+//   - secondary: DB    (durable, synced every syncInterval batches)
+//
+// If Redis is unreachable at startup the system continues in DB-only mode.
+// The returned *redis.Client may be nil if Redis fails — caller must handle this.
 func CreateProgressTracker(cfg *config.Config) (types.ProgressTracker, *redis.Client, error) {
-	client := redis.NewClient(&redis.Options{
+	// ── 1. DB tracker (mandatory — durable fallback) ──────────────────────────
+	secondary, err := createDBProgressTracker(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create DB progress tracker: %w", err)
+	}
+
+	// ── 2. Redis tracker (optional — best-effort primary) ────────────────────
+	redisClient := redis.NewClient(&redis.Options{
 		Addr:       fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
 		Password:   cfg.Redis.Password,
 		DB:         cfg.Redis.DB,
@@ -73,10 +91,119 @@ func CreateProgressTracker(cfg *config.Config) (types.ProgressTracker, *redis.Cl
 		MaxRetries: cfg.Redis.MaxRetries,
 	})
 
-	if err := client.Ping(context.Background()).Err(); err != nil {
-		return nil, nil, fmt.Errorf("redis connection failed: %w", err)
+	primary := redisTracker.NewRedisProgressTracker(redisClient, "unified_tx_parser")
+
+	redisOK := redisClient.Ping(context.Background()).Err() == nil
+	if !redisOK {
+		log.Warn("[progress] Redis unavailable at startup — running in DB-only mode")
 	}
 
-	tracker := redisTracker.NewRedisProgressTracker(client, "unified_tx_parser")
-	return tracker, client, nil
+	// ── 3. Wrap in FallbackProgressTracker ───────────────────────────────────
+	// syncInterval=10: DB checkpoint written every 10 UpdateProgress calls.
+	tracker := fallbackTracker.NewFallbackProgressTracker(primary, secondary, 10)
+	if !redisOK {
+		tracker.MarkPrimaryUnhealthy()
+	}
+
+	// Background health check: restore Redis primary when it recovers.
+	done := make(chan struct{})
+	tracker.StartHealthCheck(30*time.Second, done)
+
+	return tracker, redisClient, nil
 }
+
+// createDBProgressTracker opens a dedicated *sql.DB for the progress tracker
+// using the same DSN as the main storage engine.
+func createDBProgressTracker(cfg *config.Config) (types.ProgressTracker, error) {
+	switch cfg.Storage.Type {
+	case "mysql":
+		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+			cfg.Storage.MySQL.Username,
+			cfg.Storage.MySQL.Password,
+			cfg.Storage.MySQL.Host,
+			cfg.Storage.MySQL.Port,
+			cfg.Storage.MySQL.Database,
+		)
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("open mysql for progress tracker: %w", err)
+		}
+		db.SetMaxOpenConns(5)
+		db.SetMaxIdleConns(2)
+		if err := db.Ping(); err != nil {
+			return nil, fmt.Errorf("ping mysql for progress tracker: %w", err)
+		}
+		return dbTracker.NewDBProgressTracker(db, dbTracker.DialectMySQL), nil
+
+	case "pgsql":
+		dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+			cfg.Storage.PgSQL.Host,
+			cfg.Storage.PgSQL.Port,
+			cfg.Storage.PgSQL.Username,
+			cfg.Storage.PgSQL.Password,
+			cfg.Storage.PgSQL.Database,
+		)
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("open pgsql for progress tracker: %w", err)
+		}
+		db.SetMaxOpenConns(5)
+		db.SetMaxIdleConns(2)
+		if err := db.Ping(); err != nil {
+			return nil, fmt.Errorf("ping pgsql for progress tracker: %w", err)
+		}
+		return dbTracker.NewDBProgressTracker(db, dbTracker.DialectPostgres), nil
+
+	case "influxdb":
+		// InfluxDB has no relational tables; DB progress unavailable.
+		// Progress lives in Redis only (existing behaviour).
+		log.Warn("[progress] storage.type=influxdb: no DB fallback, Redis is the only progress store")
+		return &noopProgressTracker{}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported storage type for progress tracker: %s", cfg.Storage.Type)
+	}
+}
+
+// noopProgressTracker is a do-nothing fallback when DB progress tracking is
+// unavailable (e.g. when storage.type=influxdb).
+type noopProgressTracker struct{}
+
+func (n *noopProgressTracker) GetProgress(_ types.ChainType) (*types.ProcessProgress, error) {
+	return &types.ProcessProgress{}, nil
+}
+func (n *noopProgressTracker) UpdateProgress(_ types.ChainType, _ *types.ProcessProgress) error {
+	return nil
+}
+func (n *noopProgressTracker) ResetProgress(_ types.ChainType) error { return nil }
+func (n *noopProgressTracker) GetAllProgress() (map[types.ChainType]*types.ProcessProgress, error) {
+	return map[types.ChainType]*types.ProcessProgress{}, nil
+}
+func (n *noopProgressTracker) UpdateMultipleProgress(_ map[types.ChainType]*types.ProcessProgress) error {
+	return nil
+}
+func (n *noopProgressTracker) GetProcessingStats(_ types.ChainType) (*types.ProcessingStats, error) {
+	return &types.ProcessingStats{}, nil
+}
+func (n *noopProgressTracker) GetGlobalStats() (*types.GlobalProcessingStats, error) {
+	return &types.GlobalProcessingStats{}, nil
+}
+func (n *noopProgressTracker) SetProcessingStatus(_ types.ChainType, _ types.ProcessingStatus) error {
+	return nil
+}
+func (n *noopProgressTracker) GetProcessingStatus(_ types.ChainType) (types.ProcessingStatus, error) {
+	return types.ProcessingStatusIdle, nil
+}
+func (n *noopProgressTracker) RecordError(_ types.ChainType, _ error) error { return nil }
+func (n *noopProgressTracker) GetErrorHistory(_ types.ChainType, _ int) ([]types.ProcessingError, error) {
+	return nil, nil
+}
+func (n *noopProgressTracker) ClearErrorHistory(_ types.ChainType) error { return nil }
+func (n *noopProgressTracker) RecordProcessingMetrics(_ types.ChainType, _ *types.ProcessingMetrics) error {
+	return nil
+}
+func (n *noopProgressTracker) GetPerformanceMetrics(_ types.ChainType, _ time.Duration) (*types.PerformanceReport, error) {
+	return &types.PerformanceReport{}, nil
+}
+func (n *noopProgressTracker) HealthCheck() error            { return nil }
+func (n *noopProgressTracker) Cleanup(_ time.Duration) error { return nil }
