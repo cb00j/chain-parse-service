@@ -4,14 +4,19 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
+	"time"
 
 	"unified-tx-parser/internal/model"
 	dex "unified-tx-parser/internal/parser/dexs"
 	"unified-tx-parser/internal/types"
 
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 const (
@@ -36,10 +41,23 @@ const (
 // UniswapExtractor parses Uniswap V2/V3 DEX events on Ethereum and BSC.
 type UniswapExtractor struct {
 	*dex.EVMDexExtractor
-	// seenPools 记录已产出过 Pool 记录的池子地址,避免每笔 swap 都重复产出。
-	// extractor 实例常驻内存(factory 里只 new 一次),所以跨批次有效。
+	// seenPools 缓存已知池子的 token 地址信息,key=pool地址,value=poolMeta。
+	// 由 PairCreated/PoolCreated 事件填充,供 swap 解析时查 decimals 用。
 	// 使用 sync.Map 保证并发安全。
-	seenPools sync.Map
+	seenPools sync.Map // map[string]*poolMeta
+	// ethClient 由引擎在注册阶段通过 SetEVMProcessor 注入,用于 eth_call 查询 token 元数据。
+	// nil 表示尚未注入(降级为不归一化)
+	ethClient *ethclient.Client
+	// tokenCache 缓存已查询过的 token 元数据(addr -> model.Token)。
+	// token 元数据(decimals/symbol/name)不会变,所以 TTL 设为 30 天近似永不过期。
+	// 使用 CacheManager 保证并发安全。
+	tokenCache *dex.CacheManager[model.Token]
+}
+
+// poolMeta holds the token addresses known for a pool, populated by PairCreated/PoolCreated events.
+type poolMeta struct {
+	token0 string
+	token1 string
 }
 
 // NewUniswapExtractor creates a Uniswap extractor with EVM base class.
@@ -51,6 +69,7 @@ func NewUniswapExtractor() *UniswapExtractor {
 	}
 	return &UniswapExtractor{
 		EVMDexExtractor: dex.NewEVMDexExtractor(cfg),
+		tokenCache:      dex.NewCacheManager[model.Token](30 * 24 * time.Hour),
 	}
 }
 
@@ -90,7 +109,7 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 
 				switch logType {
 				case "swap_v2":
-					if modelTx := u.parseV2Swap(log, &tx, eventIndex, swapIdx); modelTx != nil {
+					if modelTx := u.parseV2Swap(ctx, log, &tx, eventIndex, swapIdx); modelTx != nil {
 						dexData.Transactions = append(dexData.Transactions, *modelTx)
 						swapIdx++
 					}
@@ -98,7 +117,7 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 						dexData.Pools = append(dexData.Pools, *pool)
 					}
 				case "swap_v3":
-					if modelTx := u.parseV3Swap(log, &tx, eventIndex, swapIdx); modelTx != nil {
+					if modelTx := u.parseV3Swap(ctx, log, &tx, eventIndex, swapIdx); modelTx != nil {
 						dexData.Transactions = append(dexData.Transactions, *modelTx)
 						swapIdx++
 					}
@@ -123,10 +142,28 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 				case "pair_created":
 					if pool := u.parseV2PairCreated(log, &tx); pool != nil {
 						dexData.Pools = append(dexData.Pools, *pool)
+						for _, tokenAddr := range pool.Tokens {
+							if tokenAddr == "" {
+								continue
+							}
+							if _, cached := u.tokenCache.Get(tokenAddr); !cached {
+								token := u.fetchTokenMeta(ctx, tokenAddr)
+								dexData.Tokens = append(dexData.Tokens, token)
+							}
+						}
 					}
 				case "pool_created":
 					if pool := u.parseV3PoolCreated(log, &tx); pool != nil {
 						dexData.Pools = append(dexData.Pools, *pool)
+						for _, tokenAddr := range pool.Tokens {
+							if tokenAddr == "" {
+								continue
+							}
+							if _, cached := u.tokenCache.Get(tokenAddr); !cached {
+								token := u.fetchTokenMeta(ctx, tokenAddr)
+								dexData.Tokens = append(dexData.Tokens, token)
+							}
+						}
 					}
 				}
 			}
@@ -192,12 +229,95 @@ func (u *UniswapExtractor) getLogType(log *ethtypes.Log) string {
 	}
 }
 
+// SetEVMProcessor implements engine.EVMProcessorInjectable.
+// The engine calls this at startup to hand the EVM chain client to the extractor,
+// enabling eth_call queries for token metadata (decimals/symbol/name).
+func (u *UniswapExtractor) SetEVMProcessor(processor interface{}) {
+	type ethClientGetter interface {
+		GetEthClient() *ethclient.Client
+	}
+
+	if p, ok := processor.(ethClientGetter); ok {
+		u.ethClient = p.GetEthClient()
+		u.GetLogger().Info("EVM processor injected, token metadata queries enabled")
+	}
+}
+
+// erc20ABI is the minimal ABI needed to call decimals(), symbol(), and name().
+var erc20ABI, _ = abi.JSON(strings.NewReader(`[
+	{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
+	{"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
+	{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"}
+]`))
+
+func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string) model.Token {
+	if cached, ok := u.tokenCache.Get(tokenAddr); ok {
+		return cached
+	}
+
+	// Default: assume 18 decimals. Callers get a usable value even if RPC fails.
+	token := model.Token{
+		Addr:     tokenAddr,
+		Decimals: 18,
+	}
+
+	if u.ethClient == nil {
+		u.tokenCache.Set(tokenAddr, token)
+		return token
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	addr := common.HexToAddress(tokenAddr)
+
+	// decimals()
+	if data, err := erc20ABI.Pack("decimals"); err == nil {
+		var result []byte
+		msg := ethereum.CallMsg{To: &addr, Data: data}
+		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
+			result = out
+		}
+
+		if len(result) >= 32 {
+			token.Decimals = int(new(big.Int).SetBytes(result[len(result)-32:]).Uint64())
+		}
+	}
+
+	// symbol()
+	if data, err := erc20ABI.Pack("symbol"); err == nil {
+		msg := ethereum.CallMsg{To: &addr, Data: data}
+		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
+			if vals, err := erc20ABI.Unpack("symbol", out); err == nil && len(vals) > 0 {
+				if s, ok := vals[0].(string); ok {
+					token.Symbol = s
+				}
+			}
+		}
+	}
+
+	// name()
+	if data, err := erc20ABI.Pack("name"); err == nil {
+		msg := ethereum.CallMsg{To: &addr, Data: data}
+		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
+			if vals, err := erc20ABI.Unpack("name", out); err == nil && len(vals) > 0 {
+				if s, ok := vals[0].(string); ok {
+					token.Name = s
+				}
+			}
+		}
+	}
+
+	u.tokenCache.Set(tokenAddr, token)
+	return token
+}
+
 // lazyPool 在 seenPools 缓存里没有这个地址时,产出一条最小 Pool 记录并缓存。
 // Swap 日志里拿不到 token0/token1 地址(只有 PairCreated/PoolCreated 才有),
 // 所以 Tokens 留空——表达「池子存在」已够做协议/factory 维度的统计。
 // 等后续扫到建池事件或补全 token 元数据时,存储层的 upsert 会覆盖补全。
 func (u *UniswapExtractor) lazyPool(poolAddr, factory, protocol string, tx *types.UnifiedTransaction) *model.Pool {
-	if _, loaded := u.seenPools.LoadOrStore(poolAddr, struct{}{}); loaded {
+	if _, loaded := u.seenPools.LoadOrStore(poolAddr, &poolMeta{}); loaded {
 		// 已产出过,本批次无需再产出
 		return nil
 	}
@@ -216,7 +336,7 @@ func (u *UniswapExtractor) lazyPool(poolAddr, factory, protocol string, tx *type
 }
 
 // parseV2Swap parses V2 Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)
-func (u *UniswapExtractor) parseV2Swap(log *ethtypes.Log, tx *types.UnifiedTransaction, logIdx, swapIdx int64) *model.Transaction {
+func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, tx *types.UnifiedTransaction, logIdx, swapIdx int64) *model.Transaction {
 	if len(log.Data) < 128 {
 		u.GetLogger().WithField("tx_hash", tx.TxHash).Warn("V2 swap log data too short")
 		return nil
@@ -227,8 +347,9 @@ func (u *UniswapExtractor) parseV2Swap(log *ethtypes.Log, tx *types.UnifiedTrans
 	amount0Out := new(big.Int).SetBytes(log.Data[64:96])
 	amount1Out := new(big.Int).SetBytes(log.Data[96:128])
 
+	token0IsIn := amount0In.Sign() > 0
 	var amountIn, amountOut *big.Int
-	if amount0In.Sign() > 0 {
+	if token0IsIn {
 		amountIn = amount0In
 		amountOut = amount1Out
 	} else {
@@ -236,9 +357,25 @@ func (u *UniswapExtractor) parseV2Swap(log *ethtypes.Log, tx *types.UnifiedTrans
 		amountOut = amount0Out
 	}
 
-	price := dex.CalcPrice(amountIn, amountOut)
-	value := dex.CalcValue(amountIn, price)
 	poolAddr := log.Address.Hex()
+
+	var price, value float64
+	if meta, ok := u.seenPools.Load(poolAddr); ok {
+		pm := meta.(*poolMeta)
+		var decimalsIn, decimalsOut int
+		if token0IsIn {
+			decimalsIn = u.fetchTokenMeta(ctx, pm.token0).Decimals
+			decimalsOut = u.fetchTokenMeta(ctx, pm.token1).Decimals
+		} else {
+			decimalsIn = u.fetchTokenMeta(ctx, pm.token1).Decimals
+			decimalsOut = u.fetchTokenMeta(ctx, pm.token0).Decimals
+		}
+		price = dex.CalcPriceNormalized(amountIn, decimalsIn, amountOut, decimalsOut)
+		value = dex.CalcValueNormalized(amountIn, decimalsIn, price)
+	} else {
+		price = dex.CalcPrice(amountIn, amountOut)
+		value = dex.CalcValue(amountIn, price)
+	}
 
 	return &model.Transaction{
 		Addr:        poolAddr,
@@ -265,7 +402,7 @@ func (u *UniswapExtractor) parseV2Swap(log *ethtypes.Log, tx *types.UnifiedTrans
 }
 
 // parseV3Swap parses V3 Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)
-func (u *UniswapExtractor) parseV3Swap(log *ethtypes.Log, tx *types.UnifiedTransaction, logIdx, swapIdx int64) *model.Transaction {
+func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, tx *types.UnifiedTransaction, logIdx, swapIdx int64) *model.Transaction {
 	if len(log.Data) < 160 {
 		u.GetLogger().WithField("tx_hash", tx.TxHash).Warn("V3 swap log data too short")
 		return nil
@@ -278,16 +415,34 @@ func (u *UniswapExtractor) parseV3Swap(log *ethtypes.Log, tx *types.UnifiedTrans
 	amount1 := dex.ToSignedInt256(log.Data[32:64])
 	sqrtPriceX96 := new(big.Int).SetBytes(log.Data[64:96])
 
+	// token0IsIn: amount0 > 0 means user paid token0
+	token0IsIn := amount0.Sign() > 0
 	// Pick the positive amount as amountIn (what user paid)
 	amountIn := new(big.Int).Abs(amount0)
 	amountOut := new(big.Int).Abs(amount1)
-	if amount0.Sign() < 0 {
+	if !token0IsIn {
 		amountIn, amountOut = amountOut, amountIn
 	}
 
-	price := dex.CalcV3Price(sqrtPriceX96)
-	value := dex.CalcValue(amountIn, price)
 	poolAddr := log.Address.Hex()
+	var price, value float64
+	if meta, ok := u.seenPools.Load(poolAddr); ok {
+		pm := meta.(*poolMeta)
+		var decimalsIn, decimalsOut int
+		if token0IsIn {
+			decimalsIn = u.fetchTokenMeta(ctx, pm.token0).Decimals
+			decimalsOut = u.fetchTokenMeta(ctx, pm.token1).Decimals
+		} else {
+			decimalsIn = u.fetchTokenMeta(ctx, pm.token1).Decimals
+			decimalsOut = u.fetchTokenMeta(ctx, pm.token0).Decimals
+		}
+
+		price = dex.CalcPriceNormalized(amountIn, decimalsIn, amountOut, decimalsOut)
+		value = dex.CalcValueNormalized(amountIn, decimalsIn, price)
+	} else {
+		price = dex.CalcV3Price(sqrtPriceX96)
+		value = dex.CalcValue(amountIn, price)
+	}
 
 	return &model.Transaction{
 		Addr:        poolAddr,
@@ -453,10 +608,13 @@ func (u *UniswapExtractor) parseV2PairCreated(log *ethtypes.Log, tx *types.Unifi
 	token1 := common.BytesToAddress(log.Topics[2].Bytes()).Hex()
 	pairAddr := common.BytesToAddress(log.Data[0:32]).Hex()
 
+	// 建池事件是权威来源,覆盖 lazyPool 的占位记录,存入 token 地址供后续 swap 查 decimals
+	u.seenPools.Store(pairAddr, &poolMeta{token0: token0, token1: token1})
+
 	return &model.Pool{
 		Addr:     pairAddr,
 		Factory:  uniswapV2FactoryAddr,
-		Protocol: "uniswap",
+		Protocol: "uniswap_v2",
 		Tokens:   map[int]string{0: token0, 1: token1},
 		Fee:      3000,
 		Extra: &model.PoolExtra{
@@ -479,10 +637,13 @@ func (u *UniswapExtractor) parseV3PoolCreated(log *ethtypes.Log, tx *types.Unifi
 	fee := new(big.Int).SetBytes(log.Topics[3].Bytes())
 	poolAddr := common.BytesToAddress(log.Data[32:64]).Hex()
 
+	// 建池事件是权威来源,覆盖 lazyPool 的占位记录。
+	u.seenPools.Store(poolAddr, &poolMeta{token0: token0, token1: token1})
+
 	return &model.Pool{
 		Addr:     poolAddr,
 		Factory:  uniswapV3FactoryAddr,
-		Protocol: "uniswap",
+		Protocol: "uniswap_v3",
 		Tokens:   map[int]string{0: token0, 1: token1},
 		Fee:      int(fee.Int64()),
 		Extra: &model.PoolExtra{

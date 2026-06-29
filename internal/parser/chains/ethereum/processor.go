@@ -85,6 +85,12 @@ func (e *EthereumProcessor) GetChainID() string {
 	return e.chainID.String()
 }
 
+// GetEthClient returns the underlying ethclient for use by DEX extractors
+// that need to make eth_call queries (e.g. token metadata lookups).
+func (e *EthereumProcessor) getEthClient() *ethclient.Client {
+	return e.client
+}
+
 // GetLatestBlockNumber 获取最新区块号
 func (e *EthereumProcessor) GetLatestBlockNumber(ctx context.Context) (*big.Int, error) {
 	blockNumber, err := e.client.BlockNumber(ctx)

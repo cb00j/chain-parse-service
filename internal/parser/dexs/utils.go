@@ -306,3 +306,54 @@ func GetBlockNumber(tx *types.UnifiedTransaction) int64 {
 	}
 	return tx.BlockNumber.Int64()
 }
+
+// NormalizeAmount divides a raw token amount by 10^decimals, returning a human-readable float.
+// Used to convert raw uint256 amounts (e.g. 1e18 wei) into token units (e.g. 1.0 ETH).
+func NormalizeAmount(raw *big.Int, decimals int) float64 {
+	if raw == nil || raw.Sign() == 0 || decimals < 0 {
+		return 0
+	}
+	// new(big.Int).Exp(底数, 指数, nil) e.g. 10^18
+	divisor := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+	// 除法取商
+	result, _ := new(big.Float).Quo(new(big.Float).SetInt(raw), divisor).Float64()
+
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0
+	}
+	return result
+}
+
+// CalcPriceNormalized computes price = normalizedAmountOut / normalizedAmountIn.
+// Both amounts are normalized using their respective decimals before division.
+// This replaces CalcPrice for EVM extractors that have token metadata.
+func CalcPriceNormalized(amountIn *big.Int, decimalsIn int, amountOut *big.Int, decimalsOut int) float64 {
+	if amountIn == nil || amountOut == nil || amountIn.Sign() == 0 {
+		return 0
+	}
+	in := NormalizeAmount(amountIn, decimalsIn)
+	out := NormalizeAmount(amountOut, decimalsOut)
+	if in == 0 {
+		return 0
+	}
+	price := out / in
+
+	if math.IsNaN(price) || math.IsInf(price, 0) {
+		return 0
+	}
+	return price
+}
+
+// CalcValueNormalized computes value = normalizedAmountIn * price.
+// amountIn is normalized using decimalsIn before multiplication.
+func CalcValueNormalized(amountIn *big.Int, decimals int, price float64) float64 {
+	if amountIn == nil || amountIn.Sign() == 0 || price == 0 {
+		return 0
+	}
+	normalized := NormalizeAmount(amountIn, decimals)
+	value := normalized * price
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return value
+}

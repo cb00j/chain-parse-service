@@ -22,6 +22,13 @@ type SuiProcessorInjectable interface {
 	SetSuiProcessor(processor interface{})
 }
 
+// EVMProcessorInjectable is implemented by DEX extractors that need a reference
+// to an EVM chain processor (Ethereum, BSC, etc.) for on-chain queries such as
+// token metadata (decimals/symbol/name) via eth_call.
+type EVMProcessorInjectable interface {
+	SetEVMProcessor(processor interface{})
+}
+
 // Engine orchestrates block fetching, DEX data extraction, and storage across
 // multiple blockchain networks.
 type Engine struct {
@@ -471,6 +478,11 @@ func (e *Engine) injectChainProcessors(extractor types.DexExtractors) {
 				injectable.SetSuiProcessor(processor)
 				log.Infof("injected %s chain processor into dex extractor", chainType)
 			}
+
+			if injectable, ok := extractor.(EVMProcessorInjectable); ok && chainType == types.ChainTypeEthereum {
+				injectable.SetEVMProcessor(processor)
+				log.Infof("injected %s chain processor into dex extractor", chainType)
+			}
 		}
 	}
 }
@@ -486,6 +498,11 @@ func (e *Engine) injectChainProcessorToExtractors(chainType types.ChainType, pro
 				if injectable, ok := extractor.(SuiProcessorInjectable); ok && chainType == types.ChainTypeSui {
 					injectable.SetSuiProcessor(processor)
 					log.Infof("injected %s chain processor into registered dex extractor", chainType)
+				}
+
+				if injectable, ok := extractor.(EVMProcessorInjectable); ok && chainType == types.ChainTypeEthereum {
+					injectable.SetEVMProcessor(processor)
+					log.Infof("injected %s chain processor into dex extractor", chainType)
 				}
 				break
 			}
