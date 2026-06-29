@@ -5,12 +5,12 @@ package app
 import (
 	"context"
 	"fmt"
+	redisTracker "unified-tx-parser/internal/storage/progress/redis"
 
 	"unified-tx-parser/internal/config"
 	"unified-tx-parser/internal/storage/influxdb"
 	"unified-tx-parser/internal/storage/mysql"
 	"unified-tx-parser/internal/storage/pgsql"
-	redisTracker "unified-tx-parser/internal/storage/redis"
 	"unified-tx-parser/internal/types"
 
 	"github.com/redis/go-redis/v9"

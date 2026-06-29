@@ -59,13 +59,18 @@ CREATE INDEX IF NOT EXISTS idx_ut_to_address ON transactions (to_address);
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS processing_progress (
-                                                   chain_type VARCHAR(32) PRIMARY KEY,
-    last_processed_block BIGINT NOT NULL DEFAULT 0,
-    last_update_time TIMESTAMP,
-    total_transactions BIGINT DEFAULT 0,
-    total_events BIGINT DEFAULT 0,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+                                                   chain_type           VARCHAR(32)  PRIMARY KEY,
+    last_processed_block BIGINT       NOT NULL DEFAULT 0,
+    last_update_time     TIMESTAMPTZ,
+    total_transactions   BIGINT       DEFAULT 0,
+    total_events         BIGINT       DEFAULT 0,
+    status               VARCHAR(20)  NOT NULL DEFAULT 'idle',
+    error_count          BIGINT       NOT NULL DEFAULT 0,
+    success_rate         FLOAT        NOT NULL DEFAULT 100.0,
+    start_time           TIMESTAMPTZ  NULL,
+    extra                JSONB        NULL,
+    created_at           TIMESTAMPTZ  DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ  DEFAULT NOW()
     );
 
 -- ============================================================
@@ -174,3 +179,30 @@ CREATE TABLE IF NOT EXISTS dex_reserves (
     );
 
 CREATE INDEX IF NOT EXISTS idx_dr_time ON dex_reserves (time);
+-- ============================================================
+-- 处理错误历史表 (DBProgressTracker 使用)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS processing_errors (
+                                                 id         BIGSERIAL PRIMARY KEY,
+                                                 chain_type VARCHAR(32) NOT NULL,
+    error_time TIMESTAMPTZ NOT NULL,
+    error_type VARCHAR(256),
+    error_msg  TEXT
+    );
+CREATE INDEX IF NOT EXISTS idx_pe_chain_time ON processing_errors (chain_type, error_time);
+
+-- ============================================================
+-- 处理性能指标表 (DBProgressTracker 使用)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS processing_metrics (
+                                                  id                  BIGSERIAL PRIMARY KEY,
+                                                  chain_type          VARCHAR(32) NOT NULL,
+    timestamp           TIMESTAMPTZ NOT NULL,
+    block_number        BIGINT,
+    processing_time_ns  BIGINT,
+    transaction_count   INT DEFAULT 0,
+    event_count         INT DEFAULT 0,
+    memory_usage        BIGINT DEFAULT 0,
+    cpu_usage           FLOAT DEFAULT 0
+    );
+CREATE INDEX IF NOT EXISTS idx_pm_chain_time ON processing_metrics (chain_type, timestamp);

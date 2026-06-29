@@ -57,13 +57,18 @@ CREATE TABLE IF NOT EXISTS transactions (
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS processing_progress (
-                                                   chain_type VARCHAR(32) PRIMARY KEY,
-    last_processed_block BIGINT NOT NULL DEFAULT 0,
-    last_update_time TIMESTAMP,
-    total_transactions BIGINT DEFAULT 0,
-    total_events BIGINT DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                                                   chain_type           VARCHAR(32)  PRIMARY KEY,
+    last_processed_block BIGINT       NOT NULL DEFAULT 0,
+    last_update_time     TIMESTAMP,
+    total_transactions   BIGINT       DEFAULT 0,
+    total_events         BIGINT       DEFAULT 0,
+    status               VARCHAR(20)  NOT NULL DEFAULT 'idle',
+    error_count          BIGINT       NOT NULL DEFAULT 0,
+    success_rate         FLOAT        NOT NULL DEFAULT 100.0,
+    start_time           TIMESTAMP    NULL,
+    extra                JSON         NULL,
+    created_at           TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    updated_at           TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ============================================================
@@ -167,4 +172,31 @@ CREATE TABLE IF NOT EXISTS dex_reserves (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_dr_addr_time (addr, time),
     INDEX idx_dr_time (time)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+-- ============================================================
+-- 处理错误历史表 (DBProgressTracker 使用)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS processing_errors (
+                                                 id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                                 chain_type  VARCHAR(32) NOT NULL,
+    error_time  TIMESTAMP NOT NULL,
+    error_type  VARCHAR(256),
+    error_msg   TEXT,
+    INDEX idx_pe_chain_time (chain_type, error_time)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================
+-- 处理性能指标表 (DBProgressTracker 使用)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS processing_metrics (
+                                                  id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                                  chain_type          VARCHAR(32) NOT NULL,
+    timestamp           TIMESTAMP NOT NULL,
+    block_number        BIGINT,
+    processing_time_ns  BIGINT,
+    transaction_count   INT DEFAULT 0,
+    event_count         INT DEFAULT 0,
+    memory_usage        BIGINT DEFAULT 0,
+    cpu_usage           FLOAT DEFAULT 0,
+    INDEX idx_pm_chain_time (chain_type, timestamp)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
