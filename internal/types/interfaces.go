@@ -136,6 +136,15 @@ type StorageEngine interface {
 	// pools that were already resolved before the restart.
 	GetAllPoolTokens(ctx context.Context) (map[string][2]string, error)
 
+	// GetAllTokenMeta returns addr -> full token metadata (decimals, symbol,
+	// name) for every token recorded in dex_tokens. dex_tokens is the
+	// authoritative, persistent source for token metadata; this is used at
+	// startup to warm up the in-memory token cache so a process restart
+	// doesn't re-derive any of these fields (either via eth_call or the
+	// 18-decimals/empty-string defaults) for tokens already resolved in a
+	// prior run.
+	GetAllTokenMeta(ctx context.Context) (map[string]model.Token, error)
+
 	GetStorageStats(ctx context.Context) (map[string]interface{}, error)
 	HealthCheck(ctx context.Context) error
 	Close() error

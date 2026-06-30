@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -52,6 +54,10 @@ type UniswapExtractor struct {
 	// token 元数据(decimals/symbol/name)不会变,所以 TTL 设为 30 天近似永不过期。
 	// 使用 CacheManager 保证并发安全。
 	tokenCache *dex.CacheManager[model.Token]
+	// redisClient 由引擎在注册阶段通过 SetTokenCacheRedis 注入,作为 tokenCache
+	// 和 dex_tokens 表之间的跨进程共享层。nil 表示降级为仅用本地内存缓存
+	// (单进程内有效,跨进程/跨重启不共享)。
+	redisClient *redis.Client
 }
 
 // poolMeta holds the token addresses known for a pool, populated by PairCreated/PoolCreated events.
@@ -137,7 +143,7 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 						dexData.Transactions = append(dexData.Transactions, *modelTx)
 						swapIdx++
 					}
-					if reserve := u.parseV3Reserve(log, &tx); reserve != nil {
+					if reserve := u.parseV3Reserve(ctx, log, &tx); reserve != nil {
 						dexData.Reserves = append(dexData.Reserves, *reserve)
 					}
 					if pool := u.lazyPool(log.Address.Hex(), uniswapV3FactoryAddr, "uniswap_v3", &tx); pool != nil {
@@ -152,7 +158,7 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 						dexData.Liquidities = append(dexData.Liquidities, *liq)
 					}
 				case "sync":
-					if reserve := u.parseSync(log, &tx); reserve != nil {
+					if reserve := u.parseSync(ctx, log, &tx); reserve != nil {
 						dexData.Reserves = append(dexData.Reserves, *reserve)
 					}
 				case "pair_created":
@@ -259,6 +265,66 @@ func (u *UniswapExtractor) SetEVMProcessor(processor interface{}) {
 	}
 }
 
+// WarmupPoolTokens pre-populates seenPools from previously-resolved pool
+// data so that a process restart does not re-trigger eth_call lookups for
+// pools whose token0/token1 are already known from a prior run.
+//
+// Callers fetch the {addr: {token0, token1}} map via
+// StorageEngine.GetAllPoolTokens and pass it here before the engine starts
+// processing blocks. Existing seenPools entries are not overwritten — this
+// only fills in pools the cache doesn't already have.
+func (u *UniswapExtractor) WarmupPoolTokens(poolTokens map[string][2]string) int {
+	warmed := 0
+	for addr, tokens := range poolTokens {
+		if tokens[0] == "" || tokens[1] == "" {
+			continue
+		}
+		if _, loaded := u.seenPools.LoadOrStore(addr, &poolMeta{token0: tokens[0], token1: tokens[1]}); !loaded {
+			warmed++
+		}
+	}
+	u.GetLogger().WithField("count", warmed).Info("warmed up pool token cache from storage")
+	return warmed
+}
+
+// WarmupTokenMeta pre-populates tokenCache from dex_tokens so that a
+// process restart reuses previously-resolved token metadata (decimals,
+// symbol, name) instead of either re-issuing eth_call (when enabled) or
+// silently falling back to the 18-decimals/empty-string defaults for every
+// token until it's re-resolved.
+//
+// dex_tokens is the authoritative, persistent store for token metadata —
+// decimals, symbol, and name are all written there by fetchTokenMeta, but
+// until this warmup existed, nothing ever read any of them back. Callers
+// fetch the {addr: model.Token} map via StorageEngine.GetAllTokenMeta and
+// pass it here before the engine starts processing blocks. Existing
+// tokenCache entries are not
+// overwritten.
+// WarmupTokenMeta pre-populates tokenCache from dex_tokens so that a
+// process restart reuses previously-resolved token metadata (decimals,
+// symbol, name) instead of re-issuing eth_call for every token, or
+// silently falling back to the 18-decimals/empty-string defaults until
+// it's re-resolved.
+//
+// dex_tokens is the authoritative, persistent store for token metadata —
+// decimals, symbol, and name are all written there by fetchTokenMeta but,
+// until this warmup existed, nothing ever read any of them back. Callers
+// fetch the {addr: model.Token} map via StorageEngine.GetAllTokenMeta and
+// pass it here before the engine starts processing blocks. Existing
+// tokenCache entries are not overwritten.
+func (u *UniswapExtractor) WarmupTokenMeta(tokenMeta map[string]model.Token) int {
+	warmed := 0
+	for addr, token := range tokenMeta {
+		if _, ok := u.tokenCache.Get(addr); ok {
+			continue
+		}
+		u.tokenCache.Set(addr, token)
+		warmed++
+	}
+	u.GetLogger().WithField("count", warmed).Info("warmed up token metadata cache from storage")
+	return warmed
+}
+
 // erc20ABI is the minimal ABI needed to call decimals(), symbol(), and name().
 var erc20ABI, _ = abi.JSON(strings.NewReader(`[
 	{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
@@ -280,6 +346,18 @@ var poolABI, _ = abi.JSON(strings.NewReader(`[
 func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string) model.Token {
 	if cached, ok := u.tokenCache.Get(tokenAddr); ok {
 		return cached
+	}
+
+	// Redis layer: shared across processes/restarts, sits between the local
+	// memory cache and dex_tokens. A hit here means some other run (or a
+	// prior instance of this one) already resolved this token's metadata —
+	// reuse it and backfill the memory cache so subsequent calls in this
+	// process skip Redis entirely.
+	if u.redisClient != nil {
+		if token, ok := u.getTokenMetaFromRedis(ctx, tokenAddr); ok {
+			u.tokenCache.Set(tokenAddr, token)
+			return token
+		}
 	}
 
 	// Default: assume 18 decimals. Callers get a usable value even if RPC fails.
@@ -336,7 +414,76 @@ func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string)
 	}
 
 	u.tokenCache.Set(tokenAddr, token)
+	if u.redisClient != nil {
+		u.setTokenMetaInRedis(ctx, token)
+	}
 	return token
+}
+
+// SetTokenCacheRedis implements an injectable interface (see
+// registerDexExtractors in cmd/parser) for wiring an existing *redis.Client
+// into this extractor's token cache. Redis sits between the per-process
+// tokenCache and the dex_tokens table: a metadata lookup miss in tokenCache
+// checks Redis before falling through to eth_call (or the 18-decimals
+// default), and a successful resolution is written back to Redis so other
+// processes — or this one after a restart, before WarmupTokenMeta has
+// run — can reuse it without re-deriving it.
+func (u *UniswapExtractor) SetTokenCacheRedis(client *redis.Client) {
+	u.redisClient = client
+	u.GetLogger().Info("Redis token cache layer enabled")
+}
+
+const tokenMetaRedisPrefix = "token_meta:"
+
+// getTokenMetaFromRedis reads cached metadata for tokenAddr.
+// Returns ok=false on any miss or error (key not found, Redis unavailable,
+// malformed value) — callers should treat this the same as a cache miss and
+// fall through to the next resolution step, not as a fatal error.
+// getTokenMetaFromRedis reads cached metadata for tokenAddr, stored as a
+// Redis hash with decimals/symbol/name fields. Returns ok=false on any miss
+// or error (key not found, Redis unavailable, malformed decimals value) —
+// callers should treat this the same as a cache miss and fall through to
+// the next resolution step, not as a fatal error.
+func (u *UniswapExtractor) getTokenMetaFromRedis(ctx context.Context, tokenAddr string) (model.Token, bool) {
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	key := tokenMetaRedisPrefix + strings.ToLower(tokenAddr)
+	vals, err := u.redisClient.HGetAll(callCtx, key).Result()
+	if err != nil || len(vals) == 0 {
+		return model.Token{}, false // includes redis.Nil (key doesn't exist)
+	}
+	decimals, err := strconv.Atoi(vals["decimals"])
+	if err != nil {
+		return model.Token{}, false
+	}
+	return model.Token{
+		Addr:     tokenAddr,
+		Decimals: decimals,
+		Symbol:   vals["symbol"],
+		Name:     vals["name"],
+	}, true
+}
+
+// setTokenMetaInRedis writes resolved metadata for tokenAddr. Errors are
+// logged but not returned — Redis is a best-effort acceleration layer
+// here, not a source of truth, so a failed write should not affect the
+// caller's ability to use the metadata it just resolved.
+func (u *UniswapExtractor) setTokenMetaInRedis(ctx context.Context, token model.Token) {
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	key := tokenMetaRedisPrefix + strings.ToLower(token.Addr)
+	fields := map[string]interface{}{
+		"decimals": token.Decimals,
+		"symbol":   token.Symbol,
+		"name":     token.Name,
+	}
+	if err := u.redisClient.HSet(callCtx, key, fields).Err(); err != nil {
+		u.GetLogger().WithField("token", token.Addr).Warnf("failed to write token meta to redis: %v", err)
+		return
+	}
+	u.redisClient.Expire(callCtx, key, 30*24*time.Hour)
 }
 
 // determineSide decides whether a swap is a "buy" or "sell" based on quote asset ranking.
@@ -726,7 +873,7 @@ func (u *UniswapExtractor) parseLiquidity(log *ethtypes.Log, tx *types.UnifiedTr
 // parseSync parses V2 Sync(uint112 reserve0, uint112 reserve1) into a pool reserve snapshot.
 // Sync is emitted by the pair contract itself, so log.Address is the pool address.
 // Note: Uniswap V3 does not emit Sync (concentrated liquidity), so this only covers V2 pools.
-func (u *UniswapExtractor) parseSync(log *ethtypes.Log, tx *types.UnifiedTransaction) *model.Reserve {
+func (u *UniswapExtractor) parseSync(ctx context.Context, log *ethtypes.Log, tx *types.UnifiedTransaction) *model.Reserve {
 	if len(log.Data) < 64 {
 		return nil
 	}
@@ -735,8 +882,9 @@ func (u *UniswapExtractor) parseSync(log *ethtypes.Log, tx *types.UnifiedTransac
 	reserve0 := new(big.Int).SetBytes(log.Data[0:32])
 	reserve1 := new(big.Int).SetBytes(log.Data[32:64])
 
-	return &model.Reserve{
-		Addr:     log.Address.Hex(),
+	poolAddr := log.Address.Hex()
+	reserve := &model.Reserve{
+		Addr:     poolAddr,
 		Protocol: "uniswap_v2",
 		Amounts: map[int]*big.Int{
 			0: reserve0,
@@ -744,6 +892,22 @@ func (u *UniswapExtractor) parseSync(log *ethtypes.Log, tx *types.UnifiedTransac
 		},
 		Time: uint64(tx.Timestamp.Unix()),
 	}
+
+	// Normalize into human-readable units when token decimals are already
+	// known (from a scanned PairCreated event or the startup warmup cache).
+	// resolvePoolTokens only checks the cache here — it does not issue
+	// eth_call — so this never blocks the hot path; pools not yet known
+	// simply get Value left unset, same as before this normalization existed.
+	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
+		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
+		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
+		reserve.Value = map[int]float64{
+			0: dex.NormalizeAmount(reserve0, decimals0),
+			1: dex.NormalizeAmount(reserve1, decimals1),
+		}
+	}
+
+	return reserve
 }
 
 // parseV3Reserve derives virtual reserves at the current price from a V3 Swap event.
@@ -757,7 +921,7 @@ func (u *UniswapExtractor) parseSync(log *ethtypes.Log, tx *types.UnifiedTransac
 // These are the virtual reserves backing the current price (depth at the current tick),
 // NOT the pool's total token balances. No extra RPC is needed: both fields are already
 // in the Swap log (data[64:96] = sqrtPriceX96, data[96:128] = liquidity).
-func (u *UniswapExtractor) parseV3Reserve(log *ethtypes.Log, tx *types.UnifiedTransaction) *model.Reserve {
+func (u *UniswapExtractor) parseV3Reserve(ctx context.Context, log *ethtypes.Log, tx *types.UnifiedTransaction) *model.Reserve {
 	if len(log.Data) < 160 {
 		return nil
 	}
@@ -778,8 +942,9 @@ func (u *UniswapExtractor) parseV3Reserve(log *ethtypes.Log, tx *types.UnifiedTr
 	amount1 := new(big.Int).Mul(liquidity, sqrtPriceX96)
 	amount1.Rsh(amount1, 96)
 
-	return &model.Reserve{
-		Addr:     log.Address.Hex(),
+	poolAddr := log.Address.Hex()
+	reserve := &model.Reserve{
+		Addr:     poolAddr,
 		Protocol: "uniswap_v3",
 		Amounts: map[int]*big.Int{
 			0: amount0,
@@ -787,6 +952,19 @@ func (u *UniswapExtractor) parseV3Reserve(log *ethtypes.Log, tx *types.UnifiedTr
 		},
 		Time: uint64(tx.Timestamp.Unix()),
 	}
+
+	// Normalize when token decimals are already cached (see parseSync for
+	// why this is cache-only and never blocks on eth_call).
+	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
+		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
+		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
+		reserve.Value = map[int]float64{
+			0: dex.NormalizeAmount(amount0, decimals0),
+			1: dex.NormalizeAmount(amount1, decimals1),
+		}
+	}
+
+	return reserve
 }
 
 // parseV2PairCreated parses PairCreated(address indexed token0, address indexed token1, address pair, uint256)

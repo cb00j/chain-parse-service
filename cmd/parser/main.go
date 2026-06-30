@@ -12,6 +12,7 @@ import (
 	appinit "unified-tx-parser/internal/app"
 	"unified-tx-parser/internal/config"
 	"unified-tx-parser/internal/logger"
+	"unified-tx-parser/internal/model"
 	"unified-tx-parser/internal/parser/chains/bsc"
 	"unified-tx-parser/internal/parser/chains/ethereum"
 	"unified-tx-parser/internal/parser/chains/solana"
@@ -117,7 +118,7 @@ func initApp(cfg *config.Config) (*application, error) {
 		return nil, fmt.Errorf("chain registration failed: %w", err)
 	}
 
-	if err := registerDexExtractors(eng, cfg, storage); err != nil {
+	if err := registerDexExtractors(eng, cfg, storage, redisClient); err != nil {
 		return nil, fmt.Errorf("dex registration failed: %w", err)
 	}
 
@@ -211,7 +212,7 @@ func registerChains(eng *engine.Engine, cfg *config.Config) error {
 	return nil
 }
 
-func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types.StorageEngine) error {
+func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types.StorageEngine, redisClient *redis.Client) error {
 	protocolsCfg := make(map[string]interface{})
 	for name, proto := range cfg.Protocols {
 		if proto.Enabled {
@@ -237,6 +238,25 @@ func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types
 		}
 	}
 
+	// Pre-fetch known token metadata (decimals, symbol, name) from
+	// dex_tokens — the authoritative, persistent store for token metadata.
+	// Without this, a process restart would re-derive all three fields (via
+	// eth_call, or silently default to 18 decimals / empty strings) for
+	// every token already resolved in a prior run. See
+	// UniswapExtractor.WarmupTokenMeta.
+	var tokenMeta map[string]model.Token
+	if storage != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		meta, err := storage.GetAllTokenMeta(ctx)
+		cancel()
+		if err != nil {
+			log.Warnf("token metadata warmup query failed (non-fatal, will re-derive as needed): %v", err)
+		} else {
+			tokenMeta = meta
+			log.Infof("loaded %d known token metadata entries for warmup", len(tokenMeta))
+		}
+	}
+
 	factory := dexfactory.CreateFactoryWithConfig(protocolsCfg)
 	for _, extractor := range factory.GetAllExtractors() {
 		if setter, ok := extractor.(dex.QuoteAssetSetter); ok && len(quoteAssets) > 0 {
@@ -246,6 +266,16 @@ func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types
 			WarmupPoolTokens(map[string][2]string) int
 		}); ok && len(poolTokens) > 0 {
 			warmer.WarmupPoolTokens(poolTokens)
+		}
+		if warmer, ok := extractor.(interface {
+			WarmupTokenMeta(map[string]model.Token) int
+		}); ok && len(tokenMeta) > 0 {
+			warmer.WarmupTokenMeta(tokenMeta)
+		}
+		if setter, ok := extractor.(interface {
+			SetTokenCacheRedis(*redis.Client)
+		}); ok && redisClient != nil {
+			setter.SetTokenCacheRedis(redisClient)
 		}
 		eng.RegisterDexExtractor(extractor)
 	}

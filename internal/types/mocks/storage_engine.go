@@ -3,6 +3,7 @@ package mocks
 import (
 	"context"
 
+	"unified-tx-parser/internal/model"
 	"unified-tx-parser/internal/types"
 
 	"github.com/stretchr/testify/mock"
@@ -42,6 +43,14 @@ func (m *MockStorageEngine) GetAllPoolTokens(ctx context.Context) (map[string][2
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(map[string][2]string), args.Error(1)
+}
+
+func (m *MockStorageEngine) GetAllTokenMeta(ctx context.Context) (map[string]model.Token, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]model.Token), args.Error(1)
 }
 
 func (m *MockStorageEngine) GetStorageStats(ctx context.Context) (map[string]interface{}, error) {

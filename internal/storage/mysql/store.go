@@ -603,6 +603,29 @@ func (m *MySQLStore) GetAllPoolTokens(ctx context.Context) (map[string][2]string
 	return out, rows.Err()
 }
 
+// GetAllTokenMeta returns addr -> decimals for every token in
+// dex_tokens. Used at startup to warm up the in-memory token cache so a
+// process restart doesn't re-derive decimals for tokens already resolved
+// in a prior run.
+func (m *MySQLStore) GetAllTokenMeta(ctx context.Context) (map[string]model.Token, error) {
+	rows, err := m.db.QueryContext(ctx, `SELECT addr, name, symbol, decimals FROM dex_tokens`)
+	if err != nil {
+		return nil, fmt.Errorf("query token meta: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]model.Token)
+	for rows.Next() {
+		var addr, name, symbol string
+		var decimals int
+		if err := rows.Scan(&addr, &name, &symbol, &decimals); err != nil {
+			continue
+		}
+		out[addr] = model.Token{Addr: addr, Name: name, Symbol: symbol, Decimals: decimals}
+	}
+	return out, rows.Err()
+}
+
 // HealthCheck 健康检查
 func (m *MySQLStore) HealthCheck(ctx context.Context) error {
 	return m.db.PingContext(ctx)

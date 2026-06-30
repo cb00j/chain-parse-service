@@ -457,6 +457,55 @@ func (s *SimpleInfluxDBStorage) GetAllPoolTokens(ctx context.Context) (map[strin
 	return out, nil
 }
 
+// GetAllTokenMeta returns addr -> decimals for every token recorded in
+// dex_tokens. decimals is a field (not a tag), so this groups by addr and
+// takes the latest value — token decimals never change once minted, but
+// using last() is consistent with how upsertToken overwrites prior points.
+//
+// Used at startup to warm up the in-memory token cache so a process restart
+// doesn't re-derive decimals for tokens already resolved in a prior run.
+func (s *SimpleInfluxDBStorage) GetAllTokenMeta(ctx context.Context) (map[string]model.Token, error) {
+	query := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: -365d)
+		|> filter(fn: (r) => r._measurement == "dex_tokens")
+		|> filter(fn: (r) => r._field == "decimals")
+		|> group(columns: ["addr", "name", "symbol"])
+		|> last()
+		|> group()
+		|> keep(columns: ["addr", "name", "symbol", "_value"])
+	`, s.config.Bucket)
+
+	result, err := s.queryAPI.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query token meta: %w", err)
+	}
+	defer result.Close()
+
+	out := make(map[string]model.Token)
+	for result.Next() {
+		rec := result.Record()
+		addr, _ := rec.ValueByKey("addr").(string)
+		if addr == "" {
+			continue
+		}
+		name, _ := rec.ValueByKey("name").(string)
+		symbol, _ := rec.ValueByKey("symbol").(string)
+		token := model.Token{Addr: addr, Name: name, Symbol: symbol}
+		switch v := rec.Value().(type) {
+		case int64:
+			token.Decimals = int(v)
+		case float64:
+			token.Decimals = int(v)
+		}
+		out[addr] = token
+	}
+	if result.Err() != nil {
+		return nil, fmt.Errorf("read token meta: %w", result.Err())
+	}
+	return out, nil
+}
+
 // Close 关闭存储引擎
 func (s *SimpleInfluxDBStorage) Close() error {
 	// 在关闭前刷新剩余的批量缓存
