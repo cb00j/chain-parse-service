@@ -266,6 +266,17 @@ var erc20ABI, _ = abi.JSON(strings.NewReader(`[
 	{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"}
 ]`))
 
+// poolABI is the minimal ABI needed to call token0()/token1() on a V2/V3 pool contract.
+// Both methods exist on every Uniswap V2 pair and V3 pool from the moment the contract
+// is deployed — unlike PairCreated/PoolCreated, they don't require having scanned the
+// block where the pool was created. This lets fallback paths resolve token addresses
+// for a pool encountered out of event order (e.g. its first swap was scanned before
+// its creation event), instead of falling back to raw, unnormalized price/value.
+var poolABI, _ = abi.JSON(strings.NewReader(`[
+	{"constant":true,"inputs":[],"name":"token0","outputs":[{"name":"","type":"address"}],"type":"function"},
+	{"constant":true,"inputs":[],"name":"token1","outputs":[{"name":"","type":"address"}],"type":"function"}
+]`))
+
 func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string) model.Token {
 	if cached, ok := u.tokenCache.Get(tokenAddr); ok {
 		return cached
@@ -368,6 +379,73 @@ func (u *UniswapExtractor) determineSide(tokenIn, tokenOut string) string {
 	}
 }
 
+// resolvePoolTokens looks up a pool's token0/token1 addresses via eth_call,
+// independent of whether PairCreated/PoolCreated has been scanned yet.
+//
+// This closes the gap that caused raw, unnormalized value/price for a pool's
+// first-seen swap: previously, seenPools was only populated by (a) the
+// PairCreated/PoolCreated event handler, or (b) lazyPool's placeholder entry
+// (which has empty token addresses). If a pool's first swap was scanned
+// before its creation event — or before any creation event was scanned at
+// all — parseV2Swap/parseV3Swap had no token addresses to normalize with,
+// and fell through to the raw-value fallback branch.
+//
+// Result is cached in seenPools so subsequent swaps for the same pool reuse
+// it without a repeat RPC call. Safe for concurrent first-time lookups via
+// LoadOrStore on a per-pool "resolving" marker — only one goroutine performs
+// the actual eth_call per pool.
+func (u *UniswapExtractor) resolvePoolTokens(ctx context.Context, poolAddr string) *poolMeta {
+	if meta, ok := u.seenPools.Load(poolAddr); ok {
+		pm := meta.(*poolMeta)
+		if pm.token0 != "" && pm.token1 != "" {
+			return pm
+		}
+		// Entry exists (e.g. lazyPool's placeholder) but tokens are unresolved.
+		// Fall through to resolve via eth_call below.
+	}
+
+	if u.ethClient == nil {
+		return nil
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	addr := common.HexToAddress(poolAddr)
+
+	var token0, token1 string
+
+	if data, err := poolABI.Pack("token0"); err == nil {
+		msg := ethereum.CallMsg{To: &addr, Data: data}
+		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
+			if vals, err := poolABI.Unpack("token0", out); err == nil && len(vals) > 0 {
+				if a, ok := vals[0].(common.Address); ok {
+					token0 = a.Hex()
+				}
+			}
+		}
+	}
+	if data, err := poolABI.Pack("token1"); err == nil {
+		msg := ethereum.CallMsg{To: &addr, Data: data}
+		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
+			if vals, err := poolABI.Unpack("token1", out); err == nil && len(vals) > 0 {
+				if a, ok := vals[0].(common.Address); ok {
+					token1 = a.Hex()
+				}
+			}
+		}
+	}
+
+	if token0 == "" || token1 == "" {
+		// eth_call failed (e.g. not a standard V2/V3 pool, or RPC error).
+		// Leave seenPools untouched so a later call can retry.
+		return nil
+	}
+
+	pm := &poolMeta{token0: token0, token1: token1}
+	u.seenPools.Store(poolAddr, pm)
+	return pm
+}
+
 // lazyPool 在 seenPools 缓存里没有这个地址时,产出一条最小 Pool 记录并缓存。
 // Swap 日志里拿不到 token0/token1 地址(只有 PairCreated/PoolCreated 才有),
 // 所以 Tokens 留空——表达「池子存在」已够做协议/factory 维度的统计。
@@ -417,8 +495,7 @@ func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, t
 
 	var price, value float64
 	side := "swap" // fallback when pool token addresses are unknown
-	if meta, ok := u.seenPools.Load(poolAddr); ok {
-		pm := meta.(*poolMeta)
+	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
 		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
 		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
 
@@ -506,8 +583,7 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 	poolAddr := log.Address.Hex()
 	var price, value float64
 	side := "swap"
-	if meta, ok := u.seenPools.Load(poolAddr); ok {
-		pm := meta.(*poolMeta)
+	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
 		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
 		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
 

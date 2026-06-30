@@ -10,7 +10,7 @@ chains:
     batch_size: 5
     timeout: 120
     retry_count: 3
-    start_block: 25398821
+    start_block: 25428600
 
 protocols:
   uniswap:
