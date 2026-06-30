@@ -132,6 +132,8 @@ func CalcPrice(amountIn, amountOut *big.Int) float64 {
 
 // CalcV3Price calculates price from sqrtPriceX96: price = (sqrtPriceX96 / 2^96)^2
 // Used for Uniswap V3 and PancakeSwap V3 price calculations
+// CalcV3Price calculates the raw V3 price (token1/token0) from sqrtPriceX96,
+// without decimals correction. Used as a fallback when token metadata is unavailable.
 func CalcV3Price(sqrtPriceX96 *big.Int) float64 {
 	if sqrtPriceX96 == nil || sqrtPriceX96.Sign() == 0 {
 		return 0
@@ -145,6 +147,44 @@ func CalcV3Price(sqrtPriceX96 *big.Int) float64 {
 		return 0
 	}
 	return f
+}
+
+// CalcV3PriceNormalized calculates the V3 price (token1/token0, human-readable)
+// from sqrtPriceX96, corrected for each token's decimals.
+//
+// This is the price of the pool's current state — it depends only on
+// sqrtPriceX96, NOT on which token a given swap paid in or received.
+// Unlike deriving price from a single swap's amountIn/amountOut (which flips
+// direction depending on whether the swap was a buy or a sell, producing
+// reciprocal values), this is direction-independent and should be used for
+// any time-series price data (K-line, charts, latest price, etc).
+//
+// Formula: raw_price = (sqrtPriceX96 / 2^96)^2 = token1_raw / token0_raw
+//
+//	human_price = raw_price * 10^(decimals0 - decimals1)
+func CalcV3PriceNormalized(sqrtPriceX96 *big.Int, decimals0, decimals1 int) float64 {
+	rawPrice := CalcV3Price(sqrtPriceX96)
+	if rawPrice == 0 {
+		return 0
+	}
+	exp := decimals0 - decimals1
+	scale := new(big.Float).SetFloat64(1)
+	ten := new(big.Float).SetInt64(10)
+	if exp > 0 {
+		for i := 0; i < exp; i++ {
+			scale.Mul(scale, ten)
+		}
+	} else if exp < 0 {
+		for i := 0; i < -exp; i++ {
+			scale.Quo(scale, ten)
+		}
+	}
+	scaleF, _ := scale.Float64()
+	result := rawPrice * scaleF
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0
+	}
+	return result
 }
 
 // CalcValue calculates the total value of tokens: amount * price

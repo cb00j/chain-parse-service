@@ -428,17 +428,27 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 	var price, value float64
 	if meta, ok := u.seenPools.Load(poolAddr); ok {
 		pm := meta.(*poolMeta)
-		var decimalsIn, decimalsOut int
-		if token0IsIn {
-			decimalsIn = u.fetchTokenMeta(ctx, pm.token0).Decimals
-			decimalsOut = u.fetchTokenMeta(ctx, pm.token1).Decimals
-		} else {
-			decimalsIn = u.fetchTokenMeta(ctx, pm.token1).Decimals
-			decimalsOut = u.fetchTokenMeta(ctx, pm.token0).Decimals
-		}
+		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
+		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
 
-		price = dex.CalcPriceNormalized(amountIn, decimalsIn, amountOut, decimalsOut)
-		value = dex.CalcValueNormalized(amountIn, decimalsIn, price)
+		// price is always token1/token0, independent of buy/sell direction.
+		// Deriving price from amountIn/amountOut instead would flip depending
+		// on trade direction, producing reciprocal values for buys vs sells
+		// (e.g. 1.57e-9 vs 6.34e8 for the same pool) — that bug is why this
+		// uses sqrtPriceX96 directly rather than the swap's relative amounts.
+		price = dex.CalcV3PriceNormalized(sqrtPriceX96, decimals0, decimals1)
+
+		// value is expressed in token0 terms for every swap, regardless of
+		// which side the user paid in, so volumes aggregate consistently:
+		//   token0 paid  -> value = amount0 (already in token0)
+		//   token1 paid  -> value = amount1 / price (convert token1 -> token0)
+		amount0Norm := dex.NormalizeAmount(new(big.Int).Abs(amount0), decimals0)
+		amount1Norm := dex.NormalizeAmount(new(big.Int).Abs(amount1), decimals1)
+		if token0IsIn {
+			value = amount0Norm
+		} else if price > 0 {
+			value = amount1Norm / price
+		}
 	} else {
 		price = dex.CalcV3Price(sqrtPriceX96)
 		value = dex.CalcValue(amountIn, price)
