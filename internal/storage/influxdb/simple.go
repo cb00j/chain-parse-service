@@ -479,12 +479,6 @@ func (s *SimpleInfluxDBStorage) Close() error {
 
 // upsertPool 池子数据UPSERT操作
 func (s *SimpleInfluxDBStorage) upsertPool(ctx context.Context, pool model.Pool) error {
-	// 先查询是否存在
-	exists, err := s.poolExists(ctx, pool.Addr)
-	if err != nil {
-		return fmt.Errorf("查询池子是否存在失败: %w", err)
-	}
-
 	tags := map[string]string{
 		"addr":     pool.Addr,
 		"protocol": pool.Protocol,
@@ -512,14 +506,13 @@ func (s *SimpleInfluxDBStorage) upsertPool(ctx context.Context, pool model.Pool)
 		}
 	}
 
-	// 如果存在，添加更新标记
-	if exists {
-		fields["updated"] = true
-		fields["update_time"] = time.Now().Unix()
-	} else {
-		fields["created"] = true
-		fields["create_time"] = time.Now().Unix()
-	}
+	// InfluxDB upsert semantics: writing the same measurement+tags+timestamp
+	// overwrites the previous point's fields. No need to query existence
+	// first just to pick between "created"/"updated" markers — that round
+	// trip (previously poolExists) was costing one query per pool with no
+	// downstream logic depending on the distinction.
+	fields["updated"] = true
+	fields["update_time"] = time.Now().Unix()
 
 	point := influxdb2.NewPoint(
 		"dex_pools",
@@ -533,12 +526,6 @@ func (s *SimpleInfluxDBStorage) upsertPool(ctx context.Context, pool model.Pool)
 
 // upsertToken 代币数据UPSERT操作
 func (s *SimpleInfluxDBStorage) upsertToken(ctx context.Context, token model.Token) error {
-	// 先查询是否存在
-	exists, err := s.tokenExists(ctx, token.Addr)
-	if err != nil {
-		return fmt.Errorf("查询代币是否存在失败: %w", err)
-	}
-
 	tags := map[string]string{
 		"addr":   token.Addr,
 		"name":   token.Name,
@@ -552,14 +539,10 @@ func (s *SimpleInfluxDBStorage) upsertToken(ctx context.Context, token model.Tok
 		"created_at":    token.CreatedAt,
 	}
 
-	// 如果存在，添加更新标记
-	if exists {
-		fields["updated"] = true
-		fields["update_time"] = time.Now().Unix()
-	} else {
-		fields["created"] = true
-		fields["create_time"] = time.Now().Unix()
-	}
+	// See upsertPool: InfluxDB overwrites same measurement+tags+timestamp
+	// points, so no existence query is needed just to pick this marker.
+	fields["updated"] = true
+	fields["update_time"] = time.Now().Unix()
 
 	point := influxdb2.NewPoint(
 		"dex_tokens",
@@ -573,12 +556,6 @@ func (s *SimpleInfluxDBStorage) upsertToken(ctx context.Context, token model.Tok
 
 // upsertReserve 储备数据UPSERT操作
 func (s *SimpleInfluxDBStorage) upsertReserve(ctx context.Context, reserve model.Reserve) error {
-	// 先查询是否存在
-	exists, err := s.reserveExists(ctx, reserve.Addr, reserve.Time)
-	if err != nil {
-		return fmt.Errorf("查询储备是否存在失败: %w", err)
-	}
-
 	tags := map[string]string{
 		"addr":     reserve.Addr,
 		"protocol": reserve.Protocol,
@@ -598,14 +575,13 @@ func (s *SimpleInfluxDBStorage) upsertReserve(ctx context.Context, reserve model
 		fields[fmt.Sprintf("value_%d", idx)] = value
 	}
 
-	// 如果存在，添加更新标记
-	if exists {
-		fields["updated"] = true
-		fields["update_time"] = time.Now().Unix()
-	} else {
-		fields["created"] = true
-		fields["create_time"] = time.Now().Unix()
-	}
+	// See upsertPool: InfluxDB overwrites same measurement+tags+timestamp
+	// points, so no existence query is needed just to pick this marker.
+	// This was the single biggest contributor to slow batch flushes — with
+	// reserves dominating most batches by count, the per-record existence
+	// query (one round trip per reserve) was the majority of total flush time.
+	fields["updated"] = true
+	fields["update_time"] = time.Now().Unix()
 
 	point := influxdb2.NewPoint(
 		"dex_reserves",
