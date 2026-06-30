@@ -60,12 +60,28 @@ type poolMeta struct {
 	token1 string
 }
 
+// ethereumQuoteAssets defines the quote asset ranking for Ethereum mainnet.
+// Higher rank = more preferred as the price denominator.
+// rank >= 90 = USD stablecoin; rank < 90 = non-stable quote (e.g. WETH).
+// Addresses are lowercased; comparison is case-insensitive via strings.ToLower.
+var ethereumQuoteAssets = map[string]int{
+	// USD stablecoins
+	strings.ToLower("0xdAC17F958D2ee523a2206206994597C13D831ec7"): 100, // USDT
+	strings.ToLower("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"): 100, // USDC
+	strings.ToLower("0x6B175474E89094C44Da98b954EedeAC495271d0F"): 95,  // DAI
+	strings.ToLower("0x4Fabb145d64652a948d72533023f6E7A623C7C53"): 90,  // BUSD
+	// Non-stable quotes
+	strings.ToLower("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"): 80, // WETH
+	strings.ToLower("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"): 75, // WBTC
+}
+
 // NewUniswapExtractor creates a Uniswap extractor with EVM base class.
 func NewUniswapExtractor() *UniswapExtractor {
 	cfg := &dex.BaseDexExtractorConfig{
 		Protocols:        []string{"uniswap", "uniswap-v2", "uniswap-v3"},
 		SupportedChains:  []types.ChainType{types.ChainTypeEthereum},
 		LoggerModuleName: "dex-uniswap",
+		QuoteAssets:      ethereumQuoteAssets,
 	}
 	return &UniswapExtractor{
 		EVMDexExtractor: dex.NewEVMDexExtractor(cfg),
@@ -312,6 +328,46 @@ func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string)
 	return token
 }
 
+// determineSide decides whether a swap is a "buy" or "sell" based on quote asset ranking.
+//
+// Convention (consistent with Cetus extractor):
+//   - "buy"  = user spent a quote asset to acquire the base token
+//     (e.g. paid USDC to get ETH)
+//   - "sell" = user spent the base token to acquire a quote asset
+//     (e.g. paid ETH to get USDC)
+//   - "swap" = neither token is a known quote asset (cannot determine direction)
+//
+// When both tokens are quote assets (e.g. USDC/USDT), the higher-ranked one
+// is treated as the quote; the lower-ranked one plays the base role.
+//
+// tokenIn  = address of the token the user paid
+// tokenOut = address of the token the user received
+func (u *UniswapExtractor) determineSide(tokenIn, tokenOut string) string {
+	rankIn := u.GetQuoteAssetRank(strings.ToLower(tokenIn))
+	rankOut := u.GetQuoteAssetRank(strings.ToLower(tokenOut))
+
+	inIsQuote := rankIn >= 0
+	outIsQuote := rankOut >= 0
+
+	switch {
+	case outIsQuote && !inIsQuote:
+		// User sold base token, received quote → sell
+		return "sell"
+	case inIsQuote && !outIsQuote:
+		// User spent quote token, received base → buy
+		return "buy"
+	case inIsQuote && outIsQuote:
+		// Both are quote assets (e.g. USDC → USDT); higher rank is the "real" quote.
+		if rankOut >= rankIn {
+			return "sell" // spent lower-rank quote to get higher-rank quote
+		}
+		return "buy"
+	default:
+		// Neither token is a known quote asset
+		return "swap"
+	}
+}
+
 // lazyPool 在 seenPools 缓存里没有这个地址时,产出一条最小 Pool 记录并缓存。
 // Swap 日志里拿不到 token0/token1 地址(只有 PairCreated/PoolCreated 才有),
 // 所以 Tokens 留空——表达「池子存在」已够做协议/factory 维度的统计。
@@ -360,18 +416,41 @@ func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, t
 	poolAddr := log.Address.Hex()
 
 	var price, value float64
+	side := "swap" // fallback when pool token addresses are unknown
 	if meta, ok := u.seenPools.Load(poolAddr); ok {
 		pm := meta.(*poolMeta)
-		var decimalsIn, decimalsOut int
+		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
+		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
+
+		// price is always token1/token0, independent of buy/sell direction.
+		// Deriving it from amountIn/amountOut would flip depending on trade
+		// direction, producing reciprocal values for buys vs sells — the same
+		// class of bug fixed for V3 via CalcV3PriceNormalized. V2 has no
+		// sqrtPriceX96, so instead we use whichever side of this swap is
+		// non-zero on both amount0/amount1 to derive a fixed-direction ratio:
+		// amount0 and amount1 here represent the *same* swap's two legs
+		// (one in, one out), so token1Amount/token0Amount is well-defined
+		// regardless of which leg was "in" vs "out".
+		var amount0, amount1 *big.Int
 		if token0IsIn {
-			decimalsIn = u.fetchTokenMeta(ctx, pm.token0).Decimals
-			decimalsOut = u.fetchTokenMeta(ctx, pm.token1).Decimals
+			amount0, amount1 = amountIn, amountOut
 		} else {
-			decimalsIn = u.fetchTokenMeta(ctx, pm.token1).Decimals
-			decimalsOut = u.fetchTokenMeta(ctx, pm.token0).Decimals
+			amount0, amount1 = amountOut, amountIn
 		}
-		price = dex.CalcPriceNormalized(amountIn, decimalsIn, amountOut, decimalsOut)
+		price = dex.CalcPriceNormalized(amount0, decimals0, amount1, decimals1)
+
+		var tokenIn, tokenOut string
+		if token0IsIn {
+			tokenIn, tokenOut = pm.token0, pm.token1
+		} else {
+			tokenIn, tokenOut = pm.token1, pm.token0
+		}
+		decimalsIn := decimals0
+		if !token0IsIn {
+			decimalsIn = decimals1
+		}
 		value = dex.CalcValueNormalized(amountIn, decimalsIn, price)
+		side = u.determineSide(tokenIn, tokenOut)
 	} else {
 		price = dex.CalcPrice(amountIn, amountOut)
 		value = dex.CalcValue(amountIn, price)
@@ -385,7 +464,7 @@ func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, t
 		Pool:        poolAddr,
 		Hash:        tx.TxHash,
 		From:        tx.FromAddress,
-		Side:        "swap",
+		Side:        side,
 		Amount:      amountIn,
 		Price:       price,
 		Value:       value,
@@ -426,6 +505,7 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 
 	poolAddr := log.Address.Hex()
 	var price, value float64
+	side := "swap"
 	if meta, ok := u.seenPools.Load(poolAddr); ok {
 		pm := meta.(*poolMeta)
 		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
@@ -449,6 +529,14 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 		} else if price > 0 {
 			value = amount1Norm / price
 		}
+
+		var tokenIn, tokenOut string
+		if token0IsIn {
+			tokenIn, tokenOut = pm.token0, pm.token1
+		} else {
+			tokenIn, tokenOut = pm.token1, pm.token0
+		}
+		side = u.determineSide(tokenIn, tokenOut)
 	} else {
 		price = dex.CalcV3Price(sqrtPriceX96)
 		value = dex.CalcValue(amountIn, price)
@@ -462,7 +550,7 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 		Pool:        poolAddr,
 		Hash:        tx.TxHash,
 		From:        tx.FromAddress,
-		Side:        "swap",
+		Side:        side,
 		Amount:      amountIn,
 		Price:       price,
 		Value:       value,
