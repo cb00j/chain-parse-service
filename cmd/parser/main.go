@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -116,7 +117,7 @@ func initApp(cfg *config.Config) (*application, error) {
 		return nil, fmt.Errorf("chain registration failed: %w", err)
 	}
 
-	if err := registerDexExtractors(eng, cfg); err != nil {
+	if err := registerDexExtractors(eng, cfg, storage); err != nil {
 		return nil, fmt.Errorf("dex registration failed: %w", err)
 	}
 
@@ -210,7 +211,7 @@ func registerChains(eng *engine.Engine, cfg *config.Config) error {
 	return nil
 }
 
-func registerDexExtractors(eng *engine.Engine, cfg *config.Config) error {
+func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types.StorageEngine) error {
 	protocolsCfg := make(map[string]interface{})
 	for name, proto := range cfg.Protocols {
 		if proto.Enabled {
@@ -220,10 +221,31 @@ func registerDexExtractors(eng *engine.Engine, cfg *config.Config) error {
 
 	quoteAssets := buildQuoteAssetsMap(cfg)
 
+	// Pre-fetch known pool token addresses once, shared across all extractors
+	// that support warmup. This avoids re-running eth_call for every pool on
+	// every process restart — see UniswapExtractor.WarmupPoolTokens.
+	var poolTokens map[string][2]string
+	if storage != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		tokens, err := storage.GetAllPoolTokens(ctx)
+		cancel()
+		if err != nil {
+			log.Warnf("pool token warmup query failed (non-fatal, will fall back to eth_call as needed): %v", err)
+		} else {
+			poolTokens = tokens
+			log.Infof("loaded %d known pool token mappings for warmup", len(poolTokens))
+		}
+	}
+
 	factory := dexfactory.CreateFactoryWithConfig(protocolsCfg)
 	for _, extractor := range factory.GetAllExtractors() {
 		if setter, ok := extractor.(dex.QuoteAssetSetter); ok && len(quoteAssets) > 0 {
 			setter.SetQuoteAssets(quoteAssets)
+		}
+		if warmer, ok := extractor.(interface {
+			WarmupPoolTokens(map[string][2]string) int
+		}); ok && len(poolTokens) > 0 {
+			warmer.WarmupPoolTokens(poolTokens)
 		}
 		eng.RegisterDexExtractor(extractor)
 	}

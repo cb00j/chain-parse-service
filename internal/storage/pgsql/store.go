@@ -617,6 +617,32 @@ func (p *PgSQLStore) GetStorageStats(ctx context.Context) (map[string]interface{
 	return stats, nil
 }
 
+// GetAllPoolTokens returns addr -> {token0, token1} for every pool with
+// known (non-NULL, non-empty) token addresses. Used at startup to warm up
+// the in-memory pool cache so a process restart doesn't re-trigger eth_call
+// lookups for pools already resolved before the restart.
+func (p *PgSQLStore) GetAllPoolTokens(ctx context.Context) (map[string][2]string, error) {
+	rows, err := p.db.QueryContext(ctx, `
+		SELECT addr, token0, token1 FROM dex_pools
+		WHERE token0 IS NOT NULL AND token0 != ''
+		  AND token1 IS NOT NULL AND token1 != ''
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query pool tokens: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string][2]string)
+	for rows.Next() {
+		var addr, token0, token1 string
+		if err := rows.Scan(&addr, &token0, &token1); err != nil {
+			continue
+		}
+		out[addr] = [2]string{token0, token1}
+	}
+	return out, rows.Err()
+}
+
 func (p *PgSQLStore) HealthCheck(ctx context.Context) error {
 	return p.db.PingContext(ctx)
 }

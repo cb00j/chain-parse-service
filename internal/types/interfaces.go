@@ -130,6 +130,12 @@ type StorageEngine interface {
 
 	GetTransactionsByHash(ctx context.Context, hashes []string) ([]UnifiedTransaction, error)
 
+	// GetAllPoolTokens returns addr -> {token0, token1} for every pool with
+	// known token addresses. Used at startup to warm up the in-memory pool
+	// cache so a process restart doesn't re-trigger eth_call lookups for
+	// pools that were already resolved before the restart.
+	GetAllPoolTokens(ctx context.Context) (map[string][2]string, error)
+
 	GetStorageStats(ctx context.Context) (map[string]interface{}, error)
 	HealthCheck(ctx context.Context) error
 	Close() error

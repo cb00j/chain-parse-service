@@ -412,6 +412,51 @@ func (s *SimpleInfluxDBStorage) GetBatchCacheStatus() (int, time.Time) {
 	return s.batchCache.TotalCount, s.batchCache.LastUpdated
 }
 
+// GetAllPoolTokens returns addr -> {token0, token1} for every pool that has
+// non-empty token addresses recorded in dex_pools. Pools produced only by
+// the lazy-pool placeholder path (no PairCreated/PoolCreated scanned, no
+// successful eth_call resolution) have empty token_0/token_1 tags and are
+// excluded — there is nothing useful to warm the cache with for those.
+//
+// Used at startup to pre-populate the in-memory seenPools cache so a process
+// restart doesn't re-trigger eth_call lookups for pools already resolved
+// before the restart.
+func (s *SimpleInfluxDBStorage) GetAllPoolTokens(ctx context.Context) (map[string][2]string, error) {
+	query := fmt.Sprintf(`
+		import "influxdata/influxdb/schema"
+		from(bucket: "%s")
+		|> range(start: -365d)
+		|> filter(fn: (r) => r._measurement == "dex_pools")
+		|> filter(fn: (r) => r._field == "fee")
+		|> group(columns: ["addr", "token_0", "token_1"])
+		|> last()
+		|> group()
+		|> keep(columns: ["addr", "token_0", "token_1"])
+	`, s.config.Bucket)
+
+	result, err := s.queryAPI.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query pool tokens: %w", err)
+	}
+	defer result.Close()
+
+	out := make(map[string][2]string)
+	for result.Next() {
+		rec := result.Record()
+		addr, _ := rec.ValueByKey("addr").(string)
+		token0, _ := rec.ValueByKey("token_0").(string)
+		token1, _ := rec.ValueByKey("token_1").(string)
+		if addr == "" || token0 == "" || token1 == "" {
+			continue // skip placeholder pools with unresolved tokens
+		}
+		out[addr] = [2]string{token0, token1}
+	}
+	if result.Err() != nil {
+		return nil, fmt.Errorf("read pool tokens: %w", result.Err())
+	}
+	return out, nil
+}
+
 // Close 关闭存储引擎
 func (s *SimpleInfluxDBStorage) Close() error {
 	// 在关闭前刷新剩余的批量缓存

@@ -400,10 +400,28 @@ func (u *UniswapExtractor) resolvePoolTokens(ctx context.Context, poolAddr strin
 		if pm.token0 != "" && pm.token1 != "" {
 			return pm
 		}
-		// Entry exists (e.g. lazyPool's placeholder) but tokens are unresolved.
-		// Fall through to resolve via eth_call below.
 	}
 
+	// Active eth_call resolution disabled (2026-06-30): under load, this was
+	// observed to cost tens of seconds per unresolved pool — RPC latency
+	// against the public node was high enough to stall the whole batch
+	// (one block batch took 81.4s, almost entirely waiting on a single
+	// pool's token0()/token1() calls). Until this is reworked to run off
+	// the synchronous extraction path (see TODO below), pools not already
+	// known via a scanned PairCreated/PoolCreated event or the startup
+	// warmup (WarmupPoolTokens) fall through to the raw-value fallback in
+	// parseV2Swap/parseV3Swap — same behavior as before resolvePoolTokens
+	// was introduced.
+	//
+	// TODO: move this resolution off the hot path — e.g. queue unresolved
+	// pool addresses and resolve them concurrently in a background worker,
+	// so a slow/unavailable RPC node degrades data quality for one batch
+	// instead of stalling block processing. See registerDexExtractors'
+	// WarmupPoolTokens call for the cache this would feed into.
+	return nil
+}
+
+func (u *UniswapExtractor) resolvePoolTokensViaEthCall(ctx context.Context, poolAddr string) *poolMeta {
 	if u.ethClient == nil {
 		return nil
 	}

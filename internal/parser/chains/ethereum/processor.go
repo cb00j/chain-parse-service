@@ -87,7 +87,7 @@ func (e *EthereumProcessor) GetChainID() string {
 
 // GetEthClient returns the underlying ethclient for use by DEX extractors
 // that need to make eth_call queries (e.g. token metadata lookups).
-func (e *EthereumProcessor) getEthClient() *ethclient.Client {
+func (e *EthereumProcessor) GetEthClient() *ethclient.Client {
 	return e.client
 }
 

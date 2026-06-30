@@ -36,6 +36,14 @@ func (m *MockStorageEngine) GetTransactionsByHash(ctx context.Context, hashes []
 	return args.Get(0).([]types.UnifiedTransaction), args.Error(1)
 }
 
+func (m *MockStorageEngine) GetAllPoolTokens(ctx context.Context) (map[string][2]string, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string][2]string), args.Error(1)
+}
+
 func (m *MockStorageEngine) GetStorageStats(ctx context.Context) (map[string]interface{}, error) {
 	args := m.Called(ctx)
 	if args.Get(0) == nil {
