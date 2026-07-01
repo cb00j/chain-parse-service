@@ -111,6 +111,14 @@ type DexData struct {
 	Liquidities  []model.Liquidity   `json:"liquidities"`
 	Reserves     []model.Reserve     `json:"reserves"`
 	Tokens       []model.Token       `json:"tokens"`
+	// SwapRecords holds swap events in the newer double-entry wide-table
+	// format (see model.SwapRecord) — each swap produces two entries here,
+	// one per token side. This exists alongside Transactions (not replacing
+	// it yet) because not every extractor has been migrated to the new
+	// model; extractors that have (currently: Ethereum Uniswap V2/V3)
+	// populate this instead of, or in addition to, Transactions during the
+	// transition.
+	SwapRecords []model.SwapRecord `json:"swap_records,omitempty"`
 }
 
 // DexExtractors defines the interface for extracting DEX-specific data

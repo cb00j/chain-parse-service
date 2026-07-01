@@ -34,6 +34,7 @@ type DexDataBatch struct {
 	Reserves     []model.Reserve
 	Transactions []model.Transaction
 	Liquidities  []model.Liquidity
+	SwapRecords  []model.SwapRecord
 	TotalCount   int
 	LastUpdated  time.Time
 }
@@ -215,15 +216,16 @@ func (s *SimpleInfluxDBStorage) addToBatch(dexData *types.DexData) {
 	s.batchCache.Reserves = append(s.batchCache.Reserves, dexData.Reserves...)
 	s.batchCache.Transactions = append(s.batchCache.Transactions, dexData.Transactions...)
 	s.batchCache.Liquidities = append(s.batchCache.Liquidities, dexData.Liquidities...)
+	s.batchCache.SwapRecords = append(s.batchCache.SwapRecords, dexData.SwapRecords...)
 
 	// 更新总数和时间
 	s.batchCache.TotalCount = len(s.batchCache.Pools) + len(s.batchCache.Tokens) +
-		len(s.batchCache.Reserves) + len(s.batchCache.Transactions) + len(s.batchCache.Liquidities)
+		len(s.batchCache.Reserves) + len(s.batchCache.Transactions) + len(s.batchCache.Liquidities) + len(s.batchCache.SwapRecords)
 	s.batchCache.LastUpdated = time.Now()
 
-	log.Infof("[batch cache] added data: pools=%d, tokens=%d, reserves=%d, transactions=%d, liquidities=%d, total=%d",
+	log.Infof("[batch cache] added data: pools=%d, tokens=%d, reserves=%d, transactions=%d, liquidities=%d, swap_records=%d, total=%d",
 		len(dexData.Pools), len(dexData.Tokens), len(dexData.Reserves),
-		len(dexData.Transactions), len(dexData.Liquidities), s.batchCache.TotalCount)
+		len(dexData.Transactions), len(dexData.Liquidities), len(dexData.SwapRecords), s.batchCache.TotalCount)
 }
 
 // shouldFlushBatch 检查是否应该刷新批量缓存
@@ -311,6 +313,15 @@ func (s *SimpleInfluxDBStorage) flushBatch(ctx context.Context) error {
 		totalRecords++
 	}
 
+	for _, swapRecord := range s.batchCache.SwapRecords {
+		if err := s.insertSwapRecord(ctx, swapRecord); err != nil {
+			log.Warnf("failed to store swap record: %v", err)
+			errors = append(errors, err)
+			continue
+		}
+		totalRecords++
+	}
+
 	// 强制刷新到InfluxDB
 	s.writeAPI.Flush()
 
@@ -336,6 +347,7 @@ func (s *SimpleInfluxDBStorage) clearBatchCache() {
 	s.batchCache.Reserves = s.batchCache.Reserves[:0]
 	s.batchCache.Transactions = s.batchCache.Transactions[:0]
 	s.batchCache.Liquidities = s.batchCache.Liquidities[:0]
+	s.batchCache.SwapRecords = s.batchCache.SwapRecords[:0]
 	s.batchCache.TotalCount = 0
 	s.batchCache.LastUpdated = time.Now()
 }
@@ -766,6 +778,61 @@ func (s *SimpleInfluxDBStorage) reserveExists(ctx context.Context, addr string, 
 	defer result.Close()
 
 	return result.Next(), nil
+}
+
+// insertSwapRecord writes one row of the `swaps` wide table.
+//
+// This is a plain insert, not an upsert like the older upsertPool/
+// upsertReserve — under normal operation a given (pool, token, log_index,
+// role) never gets written twice. The one case where the exact same
+// identity IS written again is the async backfill worker overwriting a row
+// to fill in TokenDecimals once it's resolved (see the worker's
+// read-modify-write flow); that reuses this same function since the
+// InfluxDB write is identical either way — only the caller differs.
+//
+// TokenDecimals is *int and nil means "not yet resolved". When nil, the
+// "token_decimals" field is simply omitted from the point rather than
+// written as some sentinel value — InfluxDB has no NULL, a field that was
+// never set is indistinguishable from one that doesn't exist yet, which is
+// exactly the semantics we want (see model.SwapRecord's doc comment: nil
+// here marks a row as a backfill candidate).
+func (s *SimpleInfluxDBStorage) insertSwapRecord(ctx context.Context, rec model.SwapRecord) error {
+	tags := map[string]string{
+		"token_address": rec.TokenAddr,
+		"pool_address":  rec.PoolAddr,
+		"protocol":      rec.Protocol,
+		"role":          string(rec.Role),
+		"side":          string(rec.Side),
+	}
+
+	fields := map[string]interface{}{
+		"tx_hash":              rec.TxHash,
+		"paired_token_address": rec.PairedTokenAddr,
+		"block_number":         rec.BlockNumber,
+	}
+
+	// RawAmount should never be nil in practice (every swap log has a
+	// concrete amount), but guard anyway rather than panicking on
+	// .String() — an amount we failed to parse is still worth recording as
+	// "0" rather than losing the whole row.
+	if rec.RawAmount != nil {
+		fields["amount"] = rec.RawAmount.String()
+	} else {
+		fields["amount"] = 0
+	}
+
+	// Omit entirely when unresolved — see doc comment above.
+	if rec.TokenDecimals != nil {
+		fields["token_decimals"] = rec.TokenDecimals
+	}
+
+	nanos := SyntheticTimestampNanos(rec.BlockTime, rec.LogIndex, rec.Role)
+
+	point := influxdb2.NewPoint("swaps", tags, fields, time.Unix(nanos, 0))
+
+	s.writeAPI.WritePoint(point)
+
+	return nil
 }
 
 // NewInfluxDBStorage 创建InfluxDB存储引擎（使用简化版本）
