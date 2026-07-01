@@ -545,6 +545,9 @@ func (s *SimpleInfluxDBStorage) upsertPool(ctx context.Context, pool model.Pool)
 		"protocol": pool.Protocol,
 		"factory":  pool.Factory,
 	}
+	if pool.Source != "" {
+		tags["source"] = string(pool.Source)
+	}
 
 	fields := map[string]interface{}{
 		"fee": pool.Fee,

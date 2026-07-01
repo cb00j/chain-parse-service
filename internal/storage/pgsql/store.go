@@ -308,9 +308,9 @@ func (p *PgSQLStore) batchUpsertPoolsChunk(ctx context.Context, tx *sql.Tx, pool
 		return nil
 	}
 
-	const cols = 7
+	const cols = 8
 	var b strings.Builder
-	b.WriteString(`INSERT INTO dex_pools (addr, factory, protocol, token0, token1, fee, extra) VALUES `)
+	b.WriteString(`INSERT INTO dex_pools (addr, factory, protocol, token0, token1, fee, source, extra) VALUES `)
 
 	args := make([]interface{}, 0, len(pools)*cols)
 	for i, pool := range pools {
@@ -318,8 +318,8 @@ func (p *PgSQLStore) batchUpsertPoolsChunk(ctx context.Context, tx *sql.Tx, pool
 			b.WriteString(",")
 		}
 		base := i * cols
-		fmt.Fprintf(&b, "($%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7)
+		fmt.Fprintf(&b, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8)
 
 		token0, token1 := "", ""
 		if v, ok := pool.Tokens[0]; ok {
@@ -334,13 +334,13 @@ func (p *PgSQLStore) batchUpsertPoolsChunk(ctx context.Context, tx *sql.Tx, pool
 				extraJSON = &s
 			}
 		}
-		args = append(args, pool.Addr, pool.Factory, pool.Protocol, token0, token1, pool.Fee, extraJSON)
+		args = append(args, pool.Addr, pool.Factory, pool.Protocol, token0, token1, pool.Fee, string(pool.Source), extraJSON)
 	}
 
 	b.WriteString(` ON CONFLICT (addr) DO UPDATE SET
 		factory=EXCLUDED.factory, protocol=EXCLUDED.protocol,
 		token0=EXCLUDED.token0, token1=EXCLUDED.token1,
-		fee=EXCLUDED.fee, extra=COALESCE(EXCLUDED.extra, dex_pools.extra),
+		fee=EXCLUDED.fee, source=EXCLUDED.source, extra=COALESCE(EXCLUDED.extra, dex_pools.extra),
 		updated_at=NOW()`)
 
 	_, err := tx.ExecContext(ctx, b.String(), args...)

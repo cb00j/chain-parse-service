@@ -292,14 +292,14 @@ func (m *MySQLStore) batchUpsertPoolsChunk(ctx context.Context, tx *sql.Tx, pool
 	}
 
 	var b strings.Builder
-	b.WriteString(`INSERT INTO dex_pools (addr, factory, protocol, token0, token1, fee, extra) VALUES `)
+	b.WriteString(`INSERT INTO dex_pools (addr, factory, protocol, token0, token1, fee, source, extra) VALUES `)
 
-	args := make([]interface{}, 0, len(pools)*7)
+	args := make([]interface{}, 0, len(pools)*8)
 	for i, pool := range pools {
 		if i > 0 {
 			b.WriteString(",")
 		}
-		b.WriteString("(?,?,?,?,?,?,?)")
+		b.WriteString("(?,?,?,?,?,?,?,?)")
 
 		token0, token1 := "", ""
 		if v, ok := pool.Tokens[0]; ok {
@@ -314,13 +314,13 @@ func (m *MySQLStore) batchUpsertPoolsChunk(ctx context.Context, tx *sql.Tx, pool
 				extraJSON = &s
 			}
 		}
-		args = append(args, pool.Addr, pool.Factory, pool.Protocol, token0, token1, pool.Fee, extraJSON)
+		args = append(args, pool.Addr, pool.Factory, pool.Protocol, token0, token1, pool.Fee, string(pool.Source), extraJSON)
 	}
 
 	b.WriteString(` ON DUPLICATE KEY UPDATE
 		factory=VALUES(factory), protocol=VALUES(protocol),
 		token0=VALUES(token0), token1=VALUES(token1),
-		fee=VALUES(fee), extra=COALESCE(VALUES(extra), extra)`)
+		fee=VALUES(fee), source=VALUES(source), extra=COALESCE(VALUES(extra), extra)`)
 
 	_, err := tx.ExecContext(ctx, b.String(), args...)
 	return err

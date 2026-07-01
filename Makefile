@@ -1,15 +1,16 @@
-.PHONY: build-parser build-api build-all test test-race test-cover test-short \
-       lint fmt vet clean run-parser run-api \
-       docker-build docker-build-parser docker-build-api \
+.PHONY: build-parser build-api build-thegraph-sync build-all test test-race test-cover test-short \
+       lint fmt vet clean run-parser run-api run-thegraph-sync \
+       docker-build docker-build-parser docker-build-api docker-build-thegraph-sync \
        docker-up docker-down docker-ps docker-logs \
        build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64 build-cross \
        help
 
 # ─── Variables ───────────────────────────────────────────────────────────────
 
-BINARY_DIR  := bin
-PARSER_BIN  := $(BINARY_DIR)/parser
-API_BIN     := $(BINARY_DIR)/api
+BINARY_DIR       := bin
+PARSER_BIN       := $(BINARY_DIR)/parser
+API_BIN          := $(BINARY_DIR)/api
+THEGRAPH_SYNC_BIN := $(BINARY_DIR)/thegraph-sync
 MODULE      := $(shell head -1 go.mod | awk '{print $$2}')
 DOCKER_DIR  := docker
 
@@ -27,6 +28,7 @@ DOCKER_REGISTRY ?=
 IMAGE_PREFIX    ?= chain-parse
 PARSER_IMAGE    := $(if $(DOCKER_REGISTRY),$(DOCKER_REGISTRY)/)$(IMAGE_PREFIX)-parser
 API_IMAGE       := $(if $(DOCKER_REGISTRY),$(DOCKER_REGISTRY)/)$(IMAGE_PREFIX)-api
+THEGRAPH_SYNC_IMAGE := $(if $(DOCKER_REGISTRY),$(DOCKER_REGISTRY)/)$(IMAGE_PREFIX)-thegraph-sync
 
 # ─── Build ───────────────────────────────────────────────────────────────────
 
@@ -40,7 +42,12 @@ build-api:
 	@mkdir -p $(BINARY_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(API_BIN) ./cmd/api/
 
-build-all: build-parser build-api
+build-thegraph-sync:
+	@echo "==> Building thegraph-sync..."
+	@mkdir -p $(BINARY_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(THEGRAPH_SYNC_BIN) ./cmd/thegraph-sync/
+
+build-all: build-parser build-api build-thegraph-sync
 
 # ─── Cross-platform Build ────────────────────────────────────────────────────
 
@@ -48,21 +55,25 @@ build-linux-amd64:
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/parser-linux-amd64 ./cmd/parser/
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/api-linux-amd64 ./cmd/api/
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/thegraph-sync-linux-amd64 ./cmd/thegraph-sync/
 
 build-linux-arm64:
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/parser-linux-arm64 ./cmd/parser/
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/api-linux-arm64 ./cmd/api/
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/thegraph-sync-linux-arm64 ./cmd/thegraph-sync/
 
 build-darwin-amd64:
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/parser-darwin-amd64 ./cmd/parser/
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/api-darwin-amd64 ./cmd/api/
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/thegraph-sync-darwin-amd64 ./cmd/thegraph-sync/
 
 build-darwin-arm64:
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/parser-darwin-arm64 ./cmd/parser/
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/api-darwin-arm64 ./cmd/api/
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINARY_DIR)/thegraph-sync-darwin-arm64 ./cmd/thegraph-sync/
 
 build-cross: build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64
 	@echo "==> Cross-platform binaries in $(BINARY_DIR)/"
@@ -105,9 +116,13 @@ run-parser: build-parser
 run-api: build-api
 	./$(API_BIN)
 
+run-thegraph-sync: build-thegraph-sync
+	@[ -n "$(CHAIN)" ] || { echo "Usage: make run-thegraph-sync CHAIN=ethereum"; exit 1; }
+	./$(THEGRAPH_SYNC_BIN) -chain $(CHAIN)
+
 # ─── Docker ──────────────────────────────────────────────────────────────────
 
-docker-build: docker-build-parser docker-build-api
+docker-build: docker-build-parser docker-build-api docker-build-thegraph-sync
 
 docker-build-parser:
 	docker build -f $(DOCKER_DIR)/Dockerfile \
@@ -125,6 +140,15 @@ docker-build-api:
 		--build-arg COMMIT=$(COMMIT) \
 		-t $(API_IMAGE):$(VERSION) \
 		-t $(API_IMAGE):latest \
+		.
+
+docker-build-thegraph-sync:
+	docker build -f $(DOCKER_DIR)/Dockerfile \
+		--build-arg SERVICE=thegraph-sync \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		-t $(THEGRAPH_SYNC_IMAGE):$(VERSION) \
+		-t $(THEGRAPH_SYNC_IMAGE):latest \
 		.
 
 docker-up:
@@ -152,6 +176,7 @@ help:
 	@echo "Build:"
 	@echo "  build-parser        Build parser binary"
 	@echo "  build-api           Build api binary"
+	@echo "  build-thegraph-sync Build thegraph-sync binary"
 	@echo "  build-all           Build all binaries"
 	@echo "  build-cross         Build for all platforms (linux/darwin x amd64/arm64)"
 	@echo ""
@@ -167,8 +192,9 @@ help:
 	@echo "  vet                 Run go vet"
 	@echo ""
 	@echo "Run:"
-	@echo "  run-parser CHAIN=x  Build and run parser (bsc/ethereum/solana/sui)"
-	@echo "  run-api             Build and run api"
+	@echo "  run-parser CHAIN=x        Build and run parser (bsc/ethereum/solana/sui)"
+	@echo "  run-api                   Build and run api"
+	@echo "  run-thegraph-sync CHAIN=x Build and run thegraph-sync (currently: ethereum only)"
 	@echo ""
 	@echo "Docker:"
 	@echo "  docker-build        Build all Docker images"

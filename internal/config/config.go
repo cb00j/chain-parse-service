@@ -46,7 +46,7 @@ type Config struct {
 	Logging     LoggingConfig             `yaml:"logging"`
 	Storage     StorageConfig             `yaml:"storage"`
 	QuoteAssets []QuoteAssetConfig        `yaml:"quoteAssets"`
-	TheGraph    TheGraphConfig            `yaml:"theGraph"`
+	TheGraph    TheGraphConfig            `yaml:"thegraph"`
 }
 
 // MySQLConfig MySQL配置
@@ -273,12 +273,10 @@ func mergeFromFile(dest *Config, path string) error {
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", path, err)
 	}
-
 	var overlay Config
 	if err := yaml.Unmarshal(data, &overlay); err != nil {
 		return fmt.Errorf("parsing %s: %w", path, err)
 	}
-
 	mergeConfig(dest, &overlay)
 	return nil
 }

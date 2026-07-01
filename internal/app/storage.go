@@ -19,6 +19,7 @@ import (
 	"unified-tx-parser/internal/types"
 
 	_ "github.com/go-sql-driver/mysql"
+	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
@@ -113,14 +114,18 @@ func CreateProgressTracker(cfg *config.Config) (types.ProgressTracker, *redis.Cl
 	return tracker, redisClient, nil
 }
 
-// CreateCursorStore creates a types.CursorStore backed by the same
-// relational database as the main storage engine (mysql/pgsql). Like
-// createDBProgressTracker, it opens its own small dedicated *sql.DB rather
-// than sharing StorageEngine's connection, keeping the two concerns
-// independent. When storage.type=influxdb (no relational DB configured),
-// this returns a no-op store — sync jobs still run, just without an
-// incremental cursor (see noopCursorStore's doc comment for the fallback
-// behavior).
+// CreateCursorStore creates a types.CursorStore appropriate for the
+// configured storage backend:
+//   - mysql/pgsql: DBCursorStore, using its own small dedicated *sql.DB
+//     rather than sharing StorageEngine's connection (same approach as
+//     createDBProgressTracker).
+//   - influxdb: InfluxCursorStore, using its own influxdb2.Client (health
+//     checked the same way NewSimpleInfluxDBStorage checks the main
+//     storage engine's connection).
+//
+// All three backends persist cursors durably — there's no no-op fallback
+// left; every supported storage.type gives incremental sync jobs (like
+// internal/thegraph.Syncer) a real place to store progress.
 func CreateCursorStore(cfg *config.Config) (types.CursorStore, error) {
 	switch cfg.Storage.Type {
 	case "mysql":
@@ -162,8 +167,20 @@ func CreateCursorStore(cfg *config.Config) (types.CursorStore, error) {
 		return cursorStore.NewDBCursorStore(db, cursorStore.DialectPostgres), nil
 
 	case "influxdb":
-		log.Warn("[thegraph] storage.type=influxdb: no relational DB for cursor persistence, sync will restart from initial_since every run")
-		return cursorStore.NewNoopCursorStore(), nil
+		client := influxdb2.NewClient(cfg.Storage.InfluxDB.URL, cfg.Storage.InfluxDB.Token)
+		health, err := client.Health(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("connect influxdb for cursor store: %w", err)
+		}
+		if health.Status != "pass" {
+			client.Close()
+			msg := ""
+			if health.Message != nil {
+				msg = *health.Message
+			}
+			return nil, fmt.Errorf("influxdb health check failed for cursor store: %s", msg)
+		}
+		return cursorStore.NewInfluxCursorStore(client, cfg.Storage.InfluxDB.Org, cfg.Storage.InfluxDB.Bucket), nil
 
 	default:
 		return nil, fmt.Errorf("unsupported storage type for cursor store: %s", cfg.Storage.Type)

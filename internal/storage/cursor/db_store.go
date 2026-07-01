@@ -1,9 +1,17 @@
+// Package cursor provides a DB-backed implementation of types.CursorStore —
+// a generic incremental-sync cursor table shared by any external prefetch
+// job (The Graph today; any future off-chain data source tomorrow).
+//
+// See database/{mysql,pgsql}/schema.sql for the sync_cursors table this
+// reads and writes, and internal/types/interfaces.go for the CursorStore
+// interface contract.
 package cursor
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
+
 	"unified-tx-parser/internal/types"
 )
 
@@ -14,8 +22,8 @@ import (
 type Dialect string
 
 const (
-	DialectMySQL    Dialect = "mysql"
-	DialectPostgres Dialect = "postgres"
+	DialectMySQL    Dialect = "mysql"    // uses ? placeholders
+	DialectPostgres Dialect = "postgres" // uses $1 $2 ... placeholders
 )
 
 // DBCursorStore implements types.CursorStore using a relational database.

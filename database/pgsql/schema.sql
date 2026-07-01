@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS dex_pools (
     token0 VARCHAR(256),
     token1 VARCHAR(256),
     fee INT DEFAULT 0,
+    source VARCHAR(32),  -- 数据来源: 'onchain' / 'thegraph'
     extra JSONB,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()

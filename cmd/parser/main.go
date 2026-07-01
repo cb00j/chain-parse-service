@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,7 +34,7 @@ var (
 var log = logger.New("parser", "main")
 
 func main() {
-	chainType := parseArgs()
+	chainType := resolveChainType(parseArgs())
 	cfg := loadConfig(chainType)
 
 	logger.SetLevel(cfg.Logging.Level)
@@ -80,10 +81,20 @@ func parseArgs() string {
 	return chain
 }
 
-func loadConfig(chainType string) *config.Config {
-	if chainType == "" {
-		chainType = os.Getenv("CHAIN_TYPE")
+// resolveChainType applies the same "-chain flag, then CHAIN_TYPE env var"
+// precedence loadConfig used to apply internally — pulled out so main()
+// has the final resolved value to pass to initApp (previously it only had
+// the pre-fallback flag value, which was wrong whenever the chain was
+// selected via env var rather than -chain).
+func resolveChainType(fromFlag string) string {
+	chain := fromFlag
+	if chain == "" {
+		chain = os.Getenv("CHAIN_TYPE")
 	}
+	return strings.ToLower(chain)
+}
+
+func loadConfig(chainType string) *config.Config {
 	if chainType == "" {
 		log.Fatal("chain type required: use -chain flag or set CHAIN_TYPE env var")
 	}

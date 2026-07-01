@@ -161,6 +161,35 @@ services:
     profiles:
       - app
 
+  # thegraph-sync is intentionally its own service, separate from parser:
+  # it's a periodic bulk-prefetch job (dex_pools/dex_tokens via the Uniswap
+  # subgraph), not part of the real-time block-scanning pipeline. Runs a
+  # single instance regardless of how many parser instances/chains you run,
+  # since Uniswap-on-Ethereum only needs syncing once. Enable it by setting
+  # thegraph.enabled: true in configs/ethereum.yaml (or CP_THEGRAPH_ENABLED).
+  thegraph-sync:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        SERVICE: thegraph-sync
+    image: chain-parse-thegraph-sync:latest
+    container_name: chain_parse_thegraph_sync
+    restart: unless-stopped
+    environment:
+      CHAIN_TYPE: ${THEGRAPH_SYNC_CHAIN:-ethereum}
+    volumes:
+      - ../configs:/app/configs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - chain_parse
+    profiles:
+      - app
+
 volumes:
   postgres_data:
   mysql_data:
