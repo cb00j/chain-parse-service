@@ -117,7 +117,7 @@ func (c *Client) fetchV2PairsSince(ctx context.Context, sinceUnix int64) ([]mode
 					continue
 				}
 				seenTokens[tf.ID] = true
-				tokens = append(tokens, tokenFiledToModelToken(tf))
+				tokens = append(tokens, tokenFieldToModelToken(tf))
 			}
 		}
 

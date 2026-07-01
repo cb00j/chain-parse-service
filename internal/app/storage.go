@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"unified-tx-parser/internal/config"
+	cursorStore "unified-tx-parser/internal/storage/cursor"
 	"unified-tx-parser/internal/storage/influxdb"
 	"unified-tx-parser/internal/storage/mysql"
 	"unified-tx-parser/internal/storage/pgsql"
@@ -110,6 +111,63 @@ func CreateProgressTracker(cfg *config.Config) (types.ProgressTracker, *redis.Cl
 	tracker.StartHealthCheck(30*time.Second, done)
 
 	return tracker, redisClient, nil
+}
+
+// CreateCursorStore creates a types.CursorStore backed by the same
+// relational database as the main storage engine (mysql/pgsql). Like
+// createDBProgressTracker, it opens its own small dedicated *sql.DB rather
+// than sharing StorageEngine's connection, keeping the two concerns
+// independent. When storage.type=influxdb (no relational DB configured),
+// this returns a no-op store — sync jobs still run, just without an
+// incremental cursor (see noopCursorStore's doc comment for the fallback
+// behavior).
+func CreateCursorStore(cfg *config.Config) (types.CursorStore, error) {
+	switch cfg.Storage.Type {
+	case "mysql":
+		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+			cfg.Storage.MySQL.Username,
+			cfg.Storage.MySQL.Password,
+			cfg.Storage.MySQL.Host,
+			cfg.Storage.MySQL.Port,
+			cfg.Storage.MySQL.Database,
+		)
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("open mysql for cursor store: %w", err)
+		}
+		db.SetMaxOpenConns(5)
+		db.SetMaxIdleConns(2)
+		if err := db.Ping(); err != nil {
+			return nil, fmt.Errorf("ping mysql for cursor store: %w", err)
+		}
+		return cursorStore.NewDBCursorStore(db, cursorStore.DialectMySQL), nil
+
+	case "pgsql":
+		dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+			cfg.Storage.PgSQL.Host,
+			cfg.Storage.PgSQL.Port,
+			cfg.Storage.PgSQL.Username,
+			cfg.Storage.PgSQL.Password,
+			cfg.Storage.PgSQL.Database,
+		)
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("open pgsql for cursor store: %w", err)
+		}
+		db.SetMaxOpenConns(5)
+		db.SetMaxIdleConns(2)
+		if err := db.Ping(); err != nil {
+			return nil, fmt.Errorf("ping pgsql for cursor store: %w", err)
+		}
+		return cursorStore.NewDBCursorStore(db, cursorStore.DialectPostgres), nil
+
+	case "influxdb":
+		log.Warn("[thegraph] storage.type=influxdb: no relational DB for cursor persistence, sync will restart from initial_since every run")
+		return cursorStore.NewNoopCursorStore(), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported storage type for cursor store: %s", cfg.Storage.Type)
+	}
 }
 
 // createDBProgressTracker opens a dedicated *sql.DB for the progress tracker

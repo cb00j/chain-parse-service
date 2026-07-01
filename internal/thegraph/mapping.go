@@ -22,6 +22,7 @@ const (
 // have — there's no feeTier field on the V2 subgraph's Pair entity because
 // the protocol itself doesn't have variable fees.
 func v2PairToModelPool(pair v2Pair) model.Pool {
+	createdAt, _ := strconv.ParseUint(pair.CreatedAtTimestamp, 10, 64) // 0 on parse failure; only used to advance the sync cursor, not persisted as authoritative
 	return model.Pool{
 		Addr:     pair.ID,
 		Factory:  uniswapV2FactoryAddr,
@@ -32,6 +33,7 @@ func v2PairToModelPool(pair v2Pair) model.Pool {
 		},
 		Fee:    3000,
 		Source: model.PoolSourceTheGraph,
+		Extra:  &model.PoolExtra{Time: createdAt},
 	}
 }
 
@@ -39,6 +41,7 @@ func v2PairToModelPool(pair v2Pair) model.Pool {
 // feeTier is a real per-pool value (500/3000/10000 etc), parsed from the
 // subgraph's string representation.
 func v3PoolToModelPool(pool v3Pool) model.Pool {
+	createdAt, _ := strconv.ParseUint(pool.CreatedAtTimestamp, 10, 64)
 	fee, _ := strconv.Atoi(pool.FeeTier) // defaults to 0 on parse failure — see note below
 	return model.Pool{
 		Addr:     pool.ID,
@@ -50,6 +53,7 @@ func v3PoolToModelPool(pool v3Pool) model.Pool {
 		},
 		Fee:    fee,
 		Source: model.PoolSourceTheGraph,
+		Extra:  &model.PoolExtra{Time: createdAt},
 	}
 }
 

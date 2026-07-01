@@ -206,3 +206,24 @@ CREATE TABLE IF NOT EXISTS processing_metrics (
     cpu_usage           FLOAT DEFAULT 0
     );
 CREATE INDEX IF NOT EXISTS idx_pm_chain_time ON processing_metrics (chain_type, timestamp);
+
+
+-- ============================================================
+-- 通用增量同步游标表 (CursorStore 使用)
+-- 通用性设计:不写死 thegraph/uniswap/ethereum,同一张表可以给
+-- 任意外部数据源 x 任意链 x 任意协议 复用(比如以后接 Covalent/
+-- Bitquery,或给 BSC 的 PancakeSwap subgraph 用),只需换
+-- source/chain_type/protocol/cursor_key 的取值,不需要新建表或加列。
+-- cursor_value 统一存成字符串,可以装时间戳、区块号或不透明的分页token。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS sync_cursors (
+                                            id           BIGSERIAL PRIMARY KEY,
+                                            source       VARCHAR(64)  NOT NULL,
+    chain_type   VARCHAR(32)  NOT NULL,
+    protocol     VARCHAR(64)  NOT NULL,
+    cursor_key   VARCHAR(64)  NOT NULL,
+    cursor_value VARCHAR(256) NOT NULL,
+    updated_at   TIMESTAMPTZ  DEFAULT NOW(),
+    created_at   TIMESTAMPTZ  DEFAULT NOW(),
+    UNIQUE (source, chain_type, protocol, cursor_key)
+    );

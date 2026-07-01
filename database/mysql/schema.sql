@@ -200,3 +200,24 @@ CREATE TABLE IF NOT EXISTS processing_metrics (
     cpu_usage           FLOAT DEFAULT 0,
     INDEX idx_pm_chain_time (chain_type, timestamp)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ============================================================
+-- 通用增量同步游标表 (CursorStore 使用)
+-- 通用性设计:不写死 thegraph/uniswap/ethereum,同一张表可以给
+-- 任意外部数据源 x 任意链 x 任意协议 复用(比如以后接 Covalent/
+-- Bitquery,或给 BSC 的 PancakeSwap subgraph 用),只需换
+-- source/chain_type/protocol/cursor_key 的取值,不需要新建表或加列。
+-- cursor_value 统一存成字符串,可以装时间戳、区块号或不透明的分页token。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS sync_cursors (
+                                            id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                            source        VARCHAR(64)  NOT NULL,   -- 数据源,例如 'thegraph'
+    chain_type    VARCHAR(32)  NOT NULL,   -- 链,例如 'ethereum'
+    protocol      VARCHAR(64)  NOT NULL,   -- 协议,例如 'uniswap_v2' / 'uniswap_v3'
+    cursor_key    VARCHAR(64)  NOT NULL,   -- 游标字段,例如 'created_at_timestamp'
+    cursor_value  VARCHAR(256) NOT NULL,   -- 游标值(字符串存储,兼容时间戳/区块号/分页token)
+    updated_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_sc_source_chain_protocol_key (source, chain_type, protocol, cursor_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

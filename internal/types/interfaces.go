@@ -158,6 +158,32 @@ type StorageEngine interface {
 	Close() error
 }
 
+// CursorStore persists incremental-sync cursors for any external prefetch
+// job (currently: The Graph subgraph sync; future: any other off-chain data
+// source). It is intentionally generic across source/chain/protocol so a
+// single table and implementation can serve all of them — see
+// internal/storage/cursor for the DB-backed implementation and
+// database/{mysql,pgsql}/schema.sql for the sync_cursors table.
+//
+// A cursor is identified by four parts:
+//   - source:     which external system produced it (e.g. "thegraph")
+//   - chainType:  which chain it applies to (e.g. "ethereum")
+//   - protocol:   which protocol/subgraph within that source (e.g. "uniswap_v2")
+//   - cursorKey:  which field within that protocol's sync is being tracked
+//     (e.g. "created_at_timestamp" for a timestamp-based cursor, or
+//     "block_number" / an opaque pagination token for others)
+//
+// The value itself is stored as a string so the same table can hold unix
+// timestamps, block numbers, or opaque cursor/page tokens without needing a
+// schema change per source.
+type CursorStore interface {
+	// GetCursor returns the persisted cursor value and true if one exists,
+	// or ("", false, nil) if no cursor has been saved yet for this key.
+	GetCursor(ctx context.Context, source, chainType, protocol, cursorKey string) (string, bool, error)
+	// SetCursor upserts the cursor value for this key.
+	SetCursor(ctx context.Context, source, chainType, protocol, cursorKey, value string) error
+}
+
 // ProgressTracker tracks block-processing progress, errors, and performance
 // metrics for each chain.
 type ProgressTracker interface {
