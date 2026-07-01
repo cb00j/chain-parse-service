@@ -46,6 +46,7 @@ type Config struct {
 	Logging     LoggingConfig             `yaml:"logging"`
 	Storage     StorageConfig             `yaml:"storage"`
 	QuoteAssets []QuoteAssetConfig        `yaml:"quoteAssets"`
+	TheGraph    TheGraphConfig            `yaml:"theGraph"`
 }
 
 // MySQLConfig MySQL配置
@@ -132,6 +133,42 @@ type InfluxDBStorageConfig struct {
 	BatchSize int    `yaml:"batch_size"`
 	FlushTime int    `yaml:"flush_time"`
 	Precision string `yaml:"precision"`
+}
+
+// TheGraphConfig configures the periodic Uniswap subgraph prefetch job
+// (internal/thegraph). It fills dex_pools / dex_tokens ahead of on-chain
+// scanning, so pool/token metadata (including decimals) is available even
+// before the corresponding PairCreated/PoolCreated event is scanned.
+//
+// V2 and V3 are separate subgraphs with separate endpoints (see
+// internal/thegraph/uniswap.go), so both must be configured independently;
+// leaving one blank disables syncing for that version only.
+type TheGraphConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	// V2Endpoint / V3Endpoint are the GraphQL endpoints for the Uniswap V2
+	// and V3 subgraphs respectively (e.g. a The Graph Gateway URL with the
+	// subgraph's deployment ID, or a self-hosted/Ormi endpoint).
+	V2Endpoint string `yaml:"v2_endpoint"`
+	V3Endpoint string `yaml:"v3_endpoint"`
+
+	// APIKey is sent as a Bearer token (The Graph Gateway auth scheme).
+	// Leave empty for endpoints that don't require auth.
+	APIKey string `yaml:"api_key"`
+
+	// SyncInterval is the delay, in seconds, between successive sync runs
+	// of the periodic job.
+	SyncInterval int `yaml:"sync_interval"`
+
+	// PageSize caps entities per GraphQL page request. The Graph enforces
+	// a hard ceiling of 1000; 0 falls back to that maximum.
+	PageSize int `yaml:"page_size"`
+
+	// InitialSince is the unix-second timestamp used as the starting
+	// cursor only on the very first run (i.e. when no cursor has been
+	// persisted yet, see the Redis-backed cursor store). 0 means "fetch
+	// from subgraph genesis," which can be a very large first sync.
+	InitialSince int64 `yaml:"initial_since"`
 }
 
 // GetEnv returns the current environment from APP_ENV (defaults to dev).
@@ -329,6 +366,9 @@ func mergeConfig(dest, src *Config) {
 		dest.QuoteAssets = src.QuoteAssets
 	}
 
+	// TheGraph
+	mergeTheGraph(&dest.TheGraph, &src.TheGraph)
+
 }
 
 func mergeRedis(dest, src *RedisConfig) {
@@ -409,6 +449,35 @@ func mergePgSQL(dest, src *PgSQLStorageConfig) {
 	}
 }
 
+// mergeTheGraph merges non-zero fields from src into dest. Enabled follows
+// the same "true wins, false is a no-op" convention as the rest of this
+// file's scalar merges: an overlay can turn syncing on, but to turn it back
+// off explicitly use an env var (CP_THEGRAPH_ENABLED=false) rather than a
+// lower-precedence YAML layer.
+func mergeTheGraph(dest, src *TheGraphConfig) {
+	if src.Enabled {
+		dest.Enabled = true
+	}
+	if src.V2Endpoint != "" {
+		dest.V2Endpoint = src.V2Endpoint
+	}
+	if src.V3Endpoint != "" {
+		dest.V3Endpoint = src.V3Endpoint
+	}
+	if src.APIKey != "" {
+		dest.APIKey = src.APIKey
+	}
+	if src.SyncInterval != 0 {
+		dest.SyncInterval = src.SyncInterval
+	}
+	if src.PageSize != 0 {
+		dest.PageSize = src.PageSize
+	}
+	if src.InitialSince != 0 {
+		dest.InitialSince = src.InitialSince
+	}
+}
+
 func mergeInfluxDB(dest, src *InfluxDBStorageConfig) {
 	if src.URL != "" {
 		dest.URL = src.URL
@@ -460,6 +529,11 @@ func mergeInfluxDB(dest, src *InfluxDBStorageConfig) {
 //	CP_INFLUXDB_BUCKET    -> storage.influxdb.bucket
 //	CP_API_PORT           -> api.port
 //	CP_RPC_ENDPOINT_{CHAIN} -> chains.{chain}.rpc_endpoint (e.g. CP_RPC_ENDPOINT_SUI)
+//	CP_THEGRAPH_ENABLED       -> thegraph.enabled
+//	CP_THEGRAPH_V2_ENDPOINT   -> thegraph.v2_endpoint
+//	CP_THEGRAPH_V3_ENDPOINT   -> thegraph.v3_endpoint
+//	CP_THEGRAPH_API_KEY       -> thegraph.api_key
+//	CP_THEGRAPH_SYNC_INTERVAL -> thegraph.sync_interval (seconds)
 func applyEnvOverrides(cfg *Config) {
 	// Logging
 	envStr(&cfg.Logging.Level, "CP_LOG_LEVEL")
@@ -504,6 +578,14 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Chains[name] = chain
 		}
 	}
+
+	// TheGraph — API key in particular should come from env/secrets rather
+	// than being committed to a YAML file.
+	envBool(&cfg.TheGraph.Enabled, "CP_THEGRAPH_ENABLED")
+	envStr(&cfg.TheGraph.V2Endpoint, "CP_THEGRAPH_V2_ENDPOINT")
+	envStr(&cfg.TheGraph.V3Endpoint, "CP_THEGRAPH_V3_ENDPOINT")
+	envStr(&cfg.TheGraph.APIKey, "CP_THEGRAPH_API_KEY")
+	envInt(&cfg.TheGraph.SyncInterval, "CP_THEGRAPH_SYNC_INTERVAL")
 }
 
 // envStr sets *dest from env var if it is set and non-empty.
@@ -518,6 +600,17 @@ func envInt(dest *int, key string) {
 	if val := os.Getenv(key); val != "" {
 		if n, err := strconv.Atoi(val); err == nil {
 			*dest = n
+		}
+	}
+}
+
+// envBool sets *dest from env var if it is set and parses as bool.
+// Accepts the same formats as strconv.ParseBool ("1", "t", "true",
+// "0", "f", "false", case-insensitive, among others).
+func envBool(dest *bool, key string) {
+	if val := os.Getenv(key); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			*dest = b
 		}
 	}
 }
@@ -578,6 +671,15 @@ func (c *Config) Validate() error {
 		}
 		if c.Storage.InfluxDB.Token == "" {
 			return fmt.Errorf("influxdb token is required")
+		}
+	}
+
+	if c.TheGraph.Enabled {
+		if c.TheGraph.V2Endpoint == "" && c.TheGraph.V3Endpoint == "" {
+			return fmt.Errorf("thegraph is enabled but neither v2_endpoint nor v3_endpoint is set")
+		}
+		if c.TheGraph.SyncInterval < 0 {
+			return fmt.Errorf("invalid thegraph sync_interval: %d (must be >= 0)", c.TheGraph.SyncInterval)
 		}
 	}
 
