@@ -99,8 +99,8 @@ CREATE INDEX IF NOT EXISTS idx_dp_factory ON dex_pools (factory);
 
 CREATE TABLE IF NOT EXISTS dex_tokens (
                                           addr VARCHAR(256) PRIMARY KEY,
-    name VARCHAR(128),
-    symbol VARCHAR(64),
+    name VARCHAR(255),
+    symbol VARCHAR(128),
     decimals INT DEFAULT 0,
     is_stable BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW(),

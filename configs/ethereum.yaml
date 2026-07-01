@@ -54,4 +54,4 @@ thegraph:
   api_key: ""
   sync_interval: 300   # 秒,两次增量同步之间的间隔
   page_size: 1000      # The Graph 单次查询上限即 1000,一般无需改
-  initial_since: 1782646490      # 首次运行(无游标时)起始时间戳;0 表示从 subgraph 创世开始拉全量
+  initial_since: 0      # 首次运行(无游标时)起始时间戳;0 表示从 subgraph 创世开始拉全量

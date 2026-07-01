@@ -57,6 +57,23 @@ func v3PoolToModelPool(pool v3Pool) model.Pool {
 	}
 }
 
+// maxTokenNameLen / maxTokenSymbolLen bound Name/Symbol before they reach
+// storage. Token metadata comes from arbitrary on-chain ERC-20 contracts —
+// anyone can deploy a token with a name like a 2000-character phishing URL
+// or emoji spam, and Uniswap V2's ~500k historical pairs (mostly unvetted,
+// long-dead spam/scam tokens) reliably contain a few. Without truncation,
+// one such token fails the whole batch insert with a "data too long"
+// error, discarding every other token/pool in that page. Truncating here
+// (not just relying on a wide-enough DB column) means storage stays safe
+// regardless of column width, and matches this package's other
+// don't-fail-the-batch-over-one-bad-record posture. Values are kept a
+// good deal shorter than the DB columns (VARCHAR(255)/VARCHAR(128)) to
+// leave headroom for multi-byte UTF-8 storage overhead.
+const (
+	maxTokenNameLen   = 200
+	maxTokenSymbolLen = 100
+)
+
 // tokenFieldToModelToken converts a subgraph token field into model.Token.
 //
 // Decimals parse failure intentionally falls back to 0, not 18: a
@@ -73,8 +90,19 @@ func tokenFieldToModelToken(tf tokenField) model.Token {
 	}
 	return model.Token{
 		Addr:     tf.ID,
-		Name:     tf.Name,
-		Symbol:   tf.Symbol,
+		Name:     truncateRunes(tf.Name, maxTokenNameLen),
+		Symbol:   truncateRunes(tf.Symbol, maxTokenSymbolLen),
 		Decimals: decimals,
 	}
+}
+
+// truncateRunes trims s to at most n runes, cutting on rune boundaries
+// (not bytes) so a multi-byte UTF-8 character never gets split into
+// invalid bytes — token names routinely contain emoji/non-Latin text.
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }

@@ -3,32 +3,68 @@ package thegraph
 import (
 	"context"
 	"fmt"
+	"strconv"
+
 	"unified-tx-parser/internal/model"
 )
 
 // pageSize is capped by the subgraph itself — The Graph's documented limit
-// is 1000 entities per query (see project history: this was verified
-// against Uniswap's own subgraph docs). Using the max reduces the number of
-// round trips for a large backlog.
+// is 1000 entities per query. Using the max reduces the number of round
+// trips for a large backlog.
 const pageSize = 1000
 
-// v2PairsQuery fetches Uniswap V2 pairs created at or after $since, ordered
-// by createdAtTimestamp so that pagination via $skip is stable even if new
-// pairs are created between pages (new pairs sort after whatever page we're
-// currently on, so they don't shift earlier rows out from under us).
+// PageResult is delivered to a PageFunc once per page fetched. LastTimestamp
+// and LastID are the createdAtTimestamp/id of the last (highest-ordered)
+// entity in this page — the caller (Syncer) persists these as the resume
+// cursor after successfully storing Pools/Tokens, so an interrupted backfill
+// resumes from the last completed page instead of restarting from scratch.
+type PageResult struct {
+	Pools         []model.Pool
+	Tokens        []model.Token
+	LastTimestamp int64
+	LastID        string
+}
+
+// PageFunc is called once per page during a paginated fetch. Returning an
+// error stops pagination immediately (the fetch function surfaces it to its
+// caller); returning nil continues to the next page.
+type PageFunc func(page PageResult) error
+
+// v2PairsQuery fetches Uniswap V2 pairs using cursor-based pagination on
+// (createdAtTimestamp, id) instead of $skip.
 //
-// token0/token1 are nested objects because the V2 subgraph's Pair entity
-// embeds them directly — one query gets both the pair and its two tokens'
-// full metadata (id/symbol/name/decimals), which is why this single query
-// can populate both dex_pools and dex_tokens without a second round trip.
+// Why not $skip: The Graph enforces a hard ceiling on skip (documented as
+// 5000) — past that, queries fail outright. A backlog like Uniswap V2's
+// ~500k historical pairs needs 500+ pages at pageSize=1000, so skip-based
+// pagination breaks after page 5. Cursor-based pagination has no such
+// limit: each page's "where" clause is anchored to the last row actually
+// seen, not an offset count.
+//
+// The cursor is the pair (createdAtTimestamp, id) rather than just
+// createdAtTimestamp alone, because many pairs can share the same
+// creation second — using timestamp alone as a ">" cursor could skip
+// same-second pairs sorted after the last one returned, or (using ">=")
+// re-return the same row forever. id is unique, so (timestamp, id) is a
+// stable total order matching orderBy below:
+//
+//	(createdAtTimestamp > $lastTs) OR (createdAtTimestamp == $lastTs AND id > $lastId)
+//
+// On the very first page the caller passes lastTs = since-1, lastId = ""
+// (empty string sorts before every real hex address), which makes the
+// first branch equivalent to "createdAtTimestamp >= since" with no special
+// case needed in the query itself.
 const v2PairsQuery = `
-query Pairs($since: Int!, $skip: Int!, $first: Int!) {
+query Pairs($lastTs: Int!, $lastId: String!, $first: Int!) {
   pairs(
-    where: { createdAtTimestamp_gte: $since }
+    where: {
+      or: [
+        { createdAtTimestamp_gt: $lastTs },
+        { createdAtTimestamp: $lastTs, id_gt: $lastId }
+      ]
+    }
     orderBy: createdAtTimestamp
     orderDirection: asc
     first: $first
-    skip: $skip
   ) {
     id
     createdAtTimestamp
@@ -56,16 +92,20 @@ type tokenField struct {
 }
 
 // v3PoolsQuery mirrors v2PairsQuery but for the V3 subgraph, where the
-// entity is named "pools" instead of "pairs". Field shape is otherwise the
-// same for our purposes.
+// entity is named "pools" instead of "pairs". Same cursor-pagination
+// reasoning applies.
 const v3PoolsQuery = `
-query Pools($since: Int!, $skip: Int!, $first: Int!) {
+query Pools($lastTs: Int!, $lastId: String!, $first: Int!) {
   pools(
-    where: { createdAtTimestamp_gte: $since }
+    where: {
+      or: [
+        { createdAtTimestamp_gt: $lastTs },
+        { createdAtTimestamp: $lastTs, id_gt: $lastId }
+      ]
+    }
     orderBy: createdAtTimestamp
     orderDirection: asc
     first: $first
-    skip: $skip
   ) {
     id
     createdAtTimestamp
@@ -87,29 +127,36 @@ type v3Pool struct {
 	Token1             tokenField `json:"token1"`
 }
 
-// FetchV2PairsSince fetches all V2 pairs created at or after sinceUnix,
-// paginating through the subgraph's 1000-entity-per-query limit until
-// exhausted. Returns pools and their tokens as model structs, ready to be
-// written to dex_pools/dex_tokens — callers don't need to know anything
-// about the subgraph's schema.
+// fetchV2PairsSince fetches all V2 pairs whose (createdAtTimestamp, id)
+// sorts strictly after (resumeTs, resumeID), invoking onPage once per page
+// (pageSize entities) as soon as it's decoded — the caller is expected to
+// persist each page and advance its own cursor immediately, rather than
+// waiting for the whole backfill to finish. This matters for large
+// backlogs (Uniswap V2 has ~500k historical pairs): a single all-or-nothing
+// fetch would need to hold everything in memory, and any timeout or crash
+// partway through would discard all progress. With per-page delivery, an
+// interrupted run has already durably stored everything up to the last
+// completed page, and the caller (Syncer) can resume from exactly there.
 //
-// sinceUnix is inclusive (createdAtTimestamp_gte) so callers doing
-// incremental sync can safely re-request the last synced timestamp on
-// every run without gaps — at worst this re-fetches (and harmlessly
-// re-upserts) the pairs from that exact second again.
-func (c *Client) fetchV2PairsSince(ctx context.Context, sinceUnix int64) ([]model.Pool, []model.Token, error) {
-	var pools []model.Pool
-	var tokens []model.Token
-	seenTokens := make(map[string]bool)
-
-	skip := 0
+// To start from an inclusive timestamp boundary (e.g. "everything from
+// unix time T onward") rather than resuming a specific in-progress page,
+// pass resumeTs = T-1, resumeID = "" — see Syncer.syncVersion.
+func (c *Client) fetchV2PairsSince(ctx context.Context, resumeTs int64, resumeID string, onPage PageFunc) error {
+	lastTs, lastID := resumeTs, resumeID
 
 	for {
 		var resp v2PairsResponse
-		vars := map[string]any{"since": sinceUnix, "skip": skip, "first": pageSize}
+		vars := map[string]any{"lastTs": lastTs, "lastId": lastID, "first": pageSize}
 		if err := c.Query(ctx, v2PairsQuery, vars, &resp); err != nil {
-			return nil, nil, fmt.Errorf("thegraph: fetch v2 pairs (skip=%d): %w", skip, err)
+			return fmt.Errorf("thegraph: fetch v2 pairs (lastTs=%d lastId=%s): %w", lastTs, lastID, err)
 		}
+		if len(resp.Pairs) == 0 {
+			return nil
+		}
+
+		pools := make([]model.Pool, 0, len(resp.Pairs))
+		var tokens []model.Token
+		seenTokens := make(map[string]bool)
 		for _, pair := range resp.Pairs {
 			pools = append(pools, v2PairToModelPool(pair))
 			for _, tf := range [2]tokenField{pair.Token0, pair.Token1} {
@@ -121,32 +168,39 @@ func (c *Client) fetchV2PairsSince(ctx context.Context, sinceUnix int64) ([]mode
 			}
 		}
 
-		if len(resp.Pairs) < pageSize {
-			break // last page
+		last := resp.Pairs[len(resp.Pairs)-1]
+		lastTs, _ = strconv.ParseInt(last.CreatedAtTimestamp, 10, 64) // 0 on parse failure — see mapping.go
+		lastID = last.ID
+
+		if err := onPage(PageResult{Pools: pools, Tokens: tokens, LastTimestamp: lastTs, LastID: lastID}); err != nil {
+			return err
 		}
 
-		skip += pageSize
+		if len(resp.Pairs) < pageSize {
+			return nil // last page
+		}
 	}
-
-	return pools, tokens, nil
 }
 
-// FetchV3PoolsSince is the V3 counterpart of FetchV2PairsSince — see its
-// doc comment for pagination/incremental-sync semantics, which are
-// identical here.
-func (c *Client) FetchV3PoolsSince(ctx context.Context, sinceUnix int64) ([]model.Pool, []model.Token, error) {
-	var pools []model.Pool
-	var tokens []model.Token
-	seenTokens := make(map[string]bool)
+// FetchV3PoolsSince is the V3 counterpart of fetchV2PairsSince — see its
+// doc comment for pagination/resume-cursor semantics, which are identical
+// here.
+func (c *Client) FetchV3PoolsSince(ctx context.Context, resumeTs int64, resumeID string, onPage PageFunc) error {
+	lastTs, lastID := resumeTs, resumeID
 
-	skip := 0
 	for {
 		var resp v3PoolsResponse
-		vars := map[string]any{"since": sinceUnix, "skip": skip, "first": pageSize}
+		vars := map[string]any{"lastTs": lastTs, "lastId": lastID, "first": pageSize}
 		if err := c.Query(ctx, v3PoolsQuery, vars, &resp); err != nil {
-			return nil, nil, fmt.Errorf("thegraph: fetch v3 pools (skip=%d): %w", skip, err)
+			return fmt.Errorf("thegraph: fetch v3 pools (lastTs=%d lastId=%s): %w", lastTs, lastID, err)
+		}
+		if len(resp.Pools) == 0 {
+			return nil
 		}
 
+		pools := make([]model.Pool, 0, len(resp.Pools))
+		var tokens []model.Token
+		seenTokens := make(map[string]bool)
 		for _, pool := range resp.Pools {
 			pools = append(pools, v3PoolToModelPool(pool))
 			for _, tf := range [2]tokenField{pool.Token0, pool.Token1} {
@@ -158,11 +212,16 @@ func (c *Client) FetchV3PoolsSince(ctx context.Context, sinceUnix int64) ([]mode
 			}
 		}
 
-		if len(resp.Pools) < pageSize {
-			break
-		}
-		skip += pageSize
-	}
+		last := resp.Pools[len(resp.Pools)-1]
+		lastTs, _ = strconv.ParseInt(last.CreatedAtTimestamp, 10, 64)
+		lastID = last.ID
 
-	return pools, tokens, nil
+		if err := onPage(PageResult{Pools: pools, Tokens: tokens, LastTimestamp: lastTs, LastID: lastID}); err != nil {
+			return err
+		}
+
+		if len(resp.Pools) < pageSize {
+			return nil
+		}
+	}
 }

@@ -117,10 +117,16 @@ func loadConfig(chainType string) *config.Config {
 	return cfg
 }
 
-// runOnce runs a single sync pass with a bounded timeout and exits via the
-// caller — used for -once / cron-style invocations.
+// runOnce runs a single sync pass and exits via the caller — used for
+// -once / cron-style invocations. Timeout is generous (60 min, not the
+// periodic loop's 5 min) because this is the path used for a full
+// historical backlog (e.g. initial_since=0 against Uniswap V2's ~500k
+// pairs, 500+ pages) — see NewClient's doc comment on why individual page
+// queries can legitimately be slow. The periodic loop doesn't need this
+// much headroom since after the first backfill it's only fetching new
+// pools since the last run.
 func runOnce(syncer *thegraph.Syncer) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 
 	if err := syncer.SyncOnce(ctx); err != nil {
