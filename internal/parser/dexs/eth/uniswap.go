@@ -12,6 +12,7 @@ import (
 	"unified-tx-parser/internal/dexcache"
 	"unified-tx-parser/internal/model"
 	dex "unified-tx-parser/internal/parser/dexs"
+	"unified-tx-parser/internal/pendingqueue"
 	"unified-tx-parser/internal/types"
 
 	"github.com/ethereum/go-ethereum"
@@ -20,6 +21,8 @@ import (
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -59,12 +62,85 @@ type UniswapExtractor struct {
 	// 和 dex_tokens 表之间的跨进程共享层。nil 表示降级为仅用本地内存缓存
 	// (单进程内有效,跨进程/跨重启不共享)。
 	redisClient *redis.Client
+	// pendingQueue 由引擎在注册阶段通过 SetPendingQueue 注入。swap 命中一个
+	// 还未知道 token0/token1 的池子时,SwapRecord(swaps 表需要 token_address
+	// 这个 tag,填不出来就没法写)不会直接丢弃,而是把这条 swap 的原始数据
+	// 存进这个队列,由 SetPendingQueue 启动的后台 worker 异步解析出池子后
+	// 补写。nil 表示直接跳过 SwapRecord(model.Transaction 不受影响,始终
+	// 正常写入,因为它不需要 token 身份信息)。
+	pendingQueue pendingqueue.Queue
+	// storage 由引擎在注册阶段通过 SetStorageEngine 注入,只给 pending queue
+	// 的 worker 用——worker 是异步跑在 ExtractDexData 之外的,没法像正常路径
+	// 那样把结果放进 dexData 让引擎代为持久化,只能自己直接写。nil 表示
+	// worker 解析出池子后只更新缓存,不落库(SwapRecord 补写这一步被跳过)。
+	storage types.StorageEngine
+	// rateLimiter 由引擎在注册阶段通过 SetRateLimiter 注入,包住这个
+	// extractor 发起的每一次 eth_call(token 元数据解析的热路径 + pending
+	// queue worker 的池子解析),两处共用同一个限流预算——不然两边各自
+	// 不限流,加起来还是可能把 RPC 节点打到限流/封禁。nil 表示不限流
+	// (兼容没配置的情况,不是默认推荐配置)。
+	rateLimiter *rate.Limiter
+	// tokenSF/poolSF 分别去重 fetchTokenMeta/resolvePoolTokensViaMulticall
+	// 的并发重复请求——当前扫描模型(单线程遍历日志、pending queue worker
+	// 单 goroutine 消费)下这两处理论上不会真的并发撞车,加这个是为了在
+	// 扫描模型以后变成并发(比如多 goroutine 并行处理区块提升吞吐)时,
+	// 不需要回头再补这一层,零值 singleflight.Group 开箱即用不需要初始化。
+	tokenSF singleflight.Group
+	poolSF  singleflight.Group
 }
 
 // poolMeta holds the token addresses known for a pool, populated by PairCreated/PoolCreated events.
 type poolMeta struct {
 	token0 string
 	token1 string
+}
+
+// buildSwapRecords constructs the two model.SwapRecord rows (one per
+// token side) for a single swap, for the `swaps` double-entry wide table.
+// Only called when a pool's token0/token1 addresses are already known —
+// token_address is a tag in InfluxDB, and tags can't be written as
+// placeholders and backfilled later the way a field can (see
+// resolvePoolTokens' doc comment on the tag-vs-field distinction). A swap
+// on a pool whose tokens aren't yet known simply gets no SwapRecord rows
+// at all (model.Transaction, which needs no token identity, is still
+// written unconditionally — see parseV2Swap/parseV3Swap) — the gap closes
+// on its own once the pool is resolved (by its creation event, a
+// thegraph-sync pass, or warmup), with no backfill needed for the swaps
+// that came before that.
+//
+// TokenDecimals is always left nil — this codebase normalizes at read
+// time (joining against dex_tokens.decimals), never at write time, so
+// there's nothing to resolve or backfill here.
+func buildSwapRecords(protocol, poolAddr, txHash string, blockNumber int64, blockTime uint64, logIndex int64,
+	token0, token1 string, amount0 *big.Int, side0 model.SwapRecordSide, amount1 *big.Int, side1 model.SwapRecordSide) []model.SwapRecord {
+	return []model.SwapRecord{
+		{
+			TokenAddr:       token0,
+			PoolAddr:        poolAddr,
+			Protocol:        protocol,
+			Role:            model.RoleToken0,
+			Side:            side0,
+			TxHash:          txHash,
+			RawAmount:       amount0,
+			PairedTokenAddr: token1,
+			BlockNumber:     blockNumber,
+			BlockTime:       blockTime,
+			LogIndex:        logIndex,
+		},
+		{
+			TokenAddr:       token1,
+			PoolAddr:        poolAddr,
+			Protocol:        protocol,
+			Role:            model.RoleToken1,
+			Side:            side1,
+			TxHash:          txHash,
+			RawAmount:       amount1,
+			PairedTokenAddr: token0,
+			BlockNumber:     blockNumber,
+			BlockTime:       blockTime,
+			LogIndex:        logIndex,
+		},
+	}
 }
 
 // ethereumQuoteAssets defines the quote asset ranking for Ethereum mainnet.
@@ -103,6 +179,7 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 		Liquidities:  make([]model.Liquidity, 0),
 		Reserves:     make([]model.Reserve, 0),
 		Tokens:       make([]model.Token, 0),
+		SwapRecords:  make([]model.SwapRecord, 0),
 	}
 
 	for _, block := range blocks {
@@ -132,16 +209,18 @@ func (u *UniswapExtractor) ExtractDexData(ctx context.Context, blocks []types.Un
 
 				switch logType {
 				case "swap_v2":
-					if modelTx := u.parseV2Swap(ctx, log, &tx, eventIndex, swapIdx); modelTx != nil {
+					if modelTx, swapRecords := u.parseV2Swap(ctx, log, &tx, eventIndex, swapIdx); modelTx != nil {
 						dexData.Transactions = append(dexData.Transactions, *modelTx)
+						dexData.SwapRecords = append(dexData.SwapRecords, swapRecords...)
 						swapIdx++
 					}
 					if pool := u.lazyPool(log.Address.Hex(), uniswapV2FactoryAddr, "uniswap_v2", &tx); pool != nil {
 						dexData.Pools = append(dexData.Pools, *pool)
 					}
 				case "swap_v3":
-					if modelTx := u.parseV3Swap(ctx, log, &tx, eventIndex, swapIdx); modelTx != nil {
+					if modelTx, swapRecords := u.parseV3Swap(ctx, log, &tx, eventIndex, swapIdx); modelTx != nil {
 						dexData.Transactions = append(dexData.Transactions, *modelTx)
+						dexData.SwapRecords = append(dexData.SwapRecords, swapRecords...)
 						swapIdx++
 					}
 					if reserve := u.parseV3Reserve(ctx, log, &tx); reserve != nil {
@@ -388,6 +467,30 @@ func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string)
 		return cached
 	}
 
+	// singleflight: collapses concurrent callers resolving the same
+	// tokenAddr into one actual resolution. Today's scanning model
+	// (single-threaded block/log iteration, serial pending-queue worker)
+	// means concurrent calls for the same token essentially can't happen
+	// yet — this is here so that stays true if that ever changes (e.g.
+	// concurrent block processing for higher throughput) instead of
+	// silently reintroducing duplicate RPC calls at that point.
+	v, _, _ := u.tokenSF.Do("token:"+tokenAddr, func() (interface{}, error) {
+		return u.resolveTokenMeta(ctx, tokenAddr), nil
+	})
+	return v.(model.Token)
+}
+
+// resolveTokenMeta does the actual cache-miss resolution work for
+// fetchTokenMeta — split out so singleflight.Do above has a single
+// function to wrap. Re-checks tokenCache first thing: if this call was
+// queued behind an identical in-flight singleflight call, that other call
+// already populated the cache by the time we get here, so this becomes a
+// cache hit instead of a second eth_call.
+func (u *UniswapExtractor) resolveTokenMeta(ctx context.Context, tokenAddr string) model.Token {
+	if cached, ok := u.tokenCache.Get(tokenAddr); ok {
+		return cached
+	}
+
 	// Redis layer: shared across processes/restarts, sits between the local
 	// memory cache and dex_tokens. A hit here means some other run (or a
 	// prior instance of this one) already resolved this token's metadata —
@@ -407,6 +510,16 @@ func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string)
 	}
 
 	if u.ethClient == nil {
+		u.tokenCache.Set(tokenAddr, token)
+		return token
+	}
+
+	// Rate limit before spending an RPC round trip — see rateLimit's doc
+	// comment. A wait/deny here just means this token falls back to the
+	// 18-decimals default for now; it isn't a fatal error, and the next
+	// call (this token showing up again, or a later thegraph-sync pass)
+	// gets another chance.
+	if err := u.rateLimit(ctx); err != nil {
 		u.tokenCache.Set(tokenAddr, token)
 		return token
 	}
@@ -479,6 +592,257 @@ func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string)
 func (u *UniswapExtractor) SetTokenCacheRedis(client *redis.Client) {
 	u.redisClient = client
 	u.GetLogger().Info("Redis token cache layer enabled")
+}
+
+// SetStorageEngine implements an injectable interface (see
+// registerDexExtractors) for wiring a types.StorageEngine into this
+// extractor — needed only by the pending-queue worker (see
+// resolvePendingPool), which runs outside the normal ExtractDexData
+// return path and so has no other way to persist what it resolves.
+func (u *UniswapExtractor) SetStorageEngine(storage types.StorageEngine) {
+	u.storage = storage
+}
+
+// SetRateLimiter implements an injectable interface (see
+// registerDexExtractors) for wiring a shared *rate.Limiter into this
+// extractor. Shared across every extractor instance the same way — one
+// limiter, one RPC budget, constructed once in cmd/parser and handed to
+// whichever extractors want it (see rateLimiter's doc comment on why the
+// hot-path and worker eth_call sites both need to draw from the same
+// budget rather than each having their own).
+func (u *UniswapExtractor) SetRateLimiter(limiter *rate.Limiter) {
+	u.rateLimiter = limiter
+}
+
+// rateLimit blocks until the shared limiter has budget for one more
+// eth_call, or ctx is cancelled first. A nil limiter (not configured) is a
+// no-op — rate limiting is an operational safety net, not something a
+// caller should have to guard against being absent.
+func (u *UniswapExtractor) rateLimit(ctx context.Context) error {
+	if u.rateLimiter == nil {
+		return nil
+	}
+	return u.rateLimiter.Wait(ctx)
+}
+
+// SetPendingQueue implements an injectable interface (see
+// registerDexExtractors) for wiring a pendingqueue.Queue into this
+// extractor, and starts the background worker that drains it. Called at
+// most once per extractor instance (registerDexExtractors' registration
+// loop runs once at startup); starting the worker here rather than
+// requiring a separate explicit "start" call keeps the two conceptually
+// tied together — a queue nobody's consuming from is just a slow memory
+// leak.
+func (u *UniswapExtractor) SetPendingQueue(q pendingqueue.Queue) {
+	u.pendingQueue = q
+	if q == nil {
+		return
+	}
+	go func() {
+		if err := q.Consume(context.Background(), u.resolvePendingPool); err != nil {
+			u.GetLogger().Warnf("pending queue worker stopped: %v", err)
+		}
+	}()
+	u.GetLogger().Info("pending queue worker started")
+}
+
+// resolvePendingPool is the pendingqueue.Queue consumer callback: resolve
+// poolAddr's token0/token1 (off the hot path, so eth_call latency here is
+// fine — this is exactly the tradeoff the queue exists to make), then
+// build and persist the SwapRecord rows for every message that was
+// waiting on this pool. Returning an error leaves msgs queued for a later
+// retry (see pendingqueue.Memory's retry/expiry handling) rather than
+// dropping them on the first failed attempt (e.g. one RPC hiccup).
+func (u *UniswapExtractor) resolvePendingPool(ctx context.Context, poolAddr string, msgs []pendingqueue.Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	protocol := msgs[0].Protocol
+
+	pm, fee := u.resolvePoolTokensViaMulticall(ctx, poolAddr, protocol)
+	if pm == nil {
+		return fmt.Errorf("could not resolve pool %s via eth_call", poolAddr)
+	}
+	u.seenPools.Store(poolAddr, pm)
+
+	// Factory is never queried on-chain — it's a fixed, known constant per
+	// protocol (same as parseV2PairCreated/parseV3PoolCreated, which also
+	// hardcode it rather than calling factory()), so there's no reason to
+	// spend an RPC round trip on it.
+	factory := uniswapV2FactoryAddr
+	if protocol == "uniswap_v3" {
+		factory = uniswapV3FactoryAddr
+	}
+
+	pool := model.Pool{
+		Addr:     poolAddr,
+		Factory:  factory,
+		Protocol: protocol,
+		Tokens:   map[int]string{0: pm.token0, 1: pm.token1},
+		Fee:      fee,
+		Source:   model.PoolSourceOnchain,
+	}
+	if u.redisClient != nil {
+		dexcache.CachePool(ctx, u.redisClient, pool)
+	}
+
+	if u.storage == nil {
+		u.GetLogger().Warnf("pool %s resolved but no storage engine wired — %d queued swap(s) will not get SwapRecord rows", poolAddr, len(msgs))
+		return nil
+	}
+
+	records := make([]model.SwapRecord, 0, len(msgs)*2)
+	for _, msg := range msgs {
+		records = append(records, buildSwapRecords(
+			msg.Protocol, msg.PoolAddr, msg.TxHash, msg.BlockNumber, msg.BlockTime, msg.LogIndex,
+			pm.token0, pm.token1, msg.Amount0, msg.Side0, msg.Amount1, msg.Side1,
+		)...)
+	}
+
+	if err := u.storage.StoreDexData(ctx, &types.DexData{
+		Pools:       []model.Pool{pool},
+		SwapRecords: records,
+	}); err != nil {
+		return fmt.Errorf("store resolved pool %s + %d swap record(s): %w", poolAddr, len(records), err)
+	}
+
+	u.GetLogger().Infof("[pendingqueue] resolved pool %s, flushed %d queued swap(s) -> %d SwapRecord row(s)", poolAddr, len(msgs), len(records))
+	return nil
+}
+
+// poolTokenABI is the minimal ABI needed to call token0()/token1()/fee()
+// on a V2/V3 pool contract — used only by resolvePoolTokensViaMulticall
+// (the pending-queue worker's resolution path). fee() only exists on V3
+// pools (V2's fee is a fixed 3000 = 0.3%, not stored on-chain at all —
+// see doResolvePoolTokensViaMulticall, which only calls it for V3).
+// Unlike the hot path, latency here doesn't matter, but the calls are
+// still batched via Multicall3 into one round trip rather than up to
+// three, since the infrastructure to do so already exists (see
+// fetchTokenMeta) and there's no reason not to.
+var poolTokenABI, _ = abi.JSON(strings.NewReader(`[
+	{"constant":true,"inputs":[],"name":"token0","outputs":[{"name":"","type":"address"}],"type":"function"},
+	{"constant":true,"inputs":[],"name":"token1","outputs":[{"name":"","type":"address"}],"type":"function"},
+	{"constant":true,"inputs":[],"name":"fee","outputs":[{"name":"","type":"uint24"}],"type":"function"}
+]`))
+
+// poolResolveResult bundles resolvePoolTokensViaMulticall's two return
+// values into one so singleflight.Do (which only supports a single
+// interface{} return) can carry both through.
+type poolResolveResult struct {
+	pm  *poolMeta
+	fee int
+}
+
+// resolvePoolTokensViaMulticall calls token0()/token1()(/fee() for V3) via
+// Multicall3 in one round trip. Only called from resolvePendingPool (the
+// pending-queue worker), never from the hot path — see this codebase's
+// history of why an unconditional eth_call fallback on the hot path was a
+// bad idea (81.4s block-batch stall) and why this one, running off to the
+// side in a background worker, doesn't have that problem.
+//
+// Returns (nil, 0) if token0/token1 couldn't be resolved. fee is always
+// 3000 for V2 (hardcoded — there's nothing to query) and best-effort for
+// V3 (0 if the fee() call itself failed, which callers should treat as
+// "unknown," not "zero-fee pool" — no real V3 pool has an actual 0 fee
+// tier).
+func (u *UniswapExtractor) resolvePoolTokensViaMulticall(ctx context.Context, poolAddr, protocol string) (*poolMeta, int) {
+	// singleflight: same rationale as fetchTokenMeta's tokenSF — the
+	// pending-queue worker is single-goroutine today (Memory.Consume
+	// processes one pool group at a time), so this can't actually race
+	// against itself yet, but it's cheap insurance against that changing
+	// (e.g. a future worker pool consuming multiple pool groups
+	// concurrently) reintroducing duplicate RPC calls silently.
+	v, _, _ := u.poolSF.Do("pool:"+poolAddr, func() (interface{}, error) {
+		pm, fee := u.doResolvePoolTokensViaMulticall(ctx, poolAddr, protocol)
+		return poolResolveResult{pm: pm, fee: fee}, nil
+	})
+	r := v.(poolResolveResult)
+	return r.pm, r.fee
+}
+
+func (u *UniswapExtractor) doResolvePoolTokensViaMulticall(ctx context.Context, poolAddr, protocol string) (*poolMeta, int) {
+	if u.ethClient == nil {
+		return nil, 0
+	}
+
+	// Rate limit before spending an RPC round trip — shared with
+	// fetchTokenMeta's limiter (see rateLimit's doc comment), so a burst
+	// of both new-pool and new-token resolution at once (e.g. catching up
+	// a backlog of blocks) is throttled against one combined budget, not
+	// two independent ones that could still add up to more than the RPC
+	// node tolerates.
+	if err := u.rateLimit(ctx); err != nil {
+		return nil, 0
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	addr := common.HexToAddress(poolAddr)
+	data0, err0 := poolTokenABI.Pack("token0")
+	data1, err1 := poolTokenABI.Pack("token1")
+	if err0 != nil || err1 != nil {
+		return nil, 0
+	}
+
+	isV3 := protocol == "uniswap_v3"
+	calls := []multicall3Call{
+		{Target: addr, AllowFailure: true, CallData: data0},
+		{Target: addr, AllowFailure: true, CallData: data1},
+	}
+	if isV3 {
+		if feeData, err := poolTokenABI.Pack("fee"); err == nil {
+			calls = append(calls, multicall3Call{Target: addr, AllowFailure: true, CallData: feeData})
+		}
+	}
+
+	packed, err := multicall3ABI.Pack("aggregate3", calls)
+	if err != nil {
+		return nil, 0
+	}
+
+	mcAddr := common.HexToAddress(multicall3Address)
+	msg := ethereum.CallMsg{To: &mcAddr, Data: packed}
+	out, err := u.ethClient.CallContract(callCtx, msg, nil)
+	if err != nil {
+		return nil, 0
+	}
+
+	var results []multicall3Result
+	if err := multicall3ABI.UnpackIntoInterface(&results, "aggregate3", out); err != nil || len(results) < 2 {
+		return nil, 0
+	}
+
+	var token0, token1 string
+	if r := results[0]; r.Success {
+		if vals, err := poolTokenABI.Unpack("token0", r.ReturnData); err == nil && len(vals) > 0 {
+			if a, ok := vals[0].(common.Address); ok {
+				token0 = a.Hex()
+			}
+		}
+	}
+	if r := results[1]; r.Success {
+		if vals, err := poolTokenABI.Unpack("token1", r.ReturnData); err == nil && len(vals) > 0 {
+			if a, ok := vals[0].(common.Address); ok {
+				token1 = a.Hex()
+			}
+		}
+	}
+	if token0 == "" || token1 == "" {
+		return nil, 0
+	}
+
+	fee := 3000 // V2 fixed fee — there's no fee() to call, so this is the answer regardless of what (if anything) came back in a 3rd result slot
+	if isV3 && len(results) == 3 {
+		if r := results[2]; r.Success && len(r.ReturnData) >= 32 {
+			// uint24, right-aligned in the 32-byte word — same
+			// byte-slicing approach as fetchTokenMeta's decimals parse,
+			// simpler than abi.Unpack for a small fixed-width integer.
+			fee = int(new(big.Int).SetBytes(r.ReturnData[len(r.ReturnData)-32:]).Uint64())
+		}
+	}
+
+	return &poolMeta{token0: token0, token1: token1}, fee
 }
 
 const tokenMetaRedisPrefix = "token_meta:"
@@ -656,10 +1020,10 @@ func (u *UniswapExtractor) lazyPool(poolAddr, factory, protocol string, tx *type
 }
 
 // parseV2Swap parses V2 Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)
-func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, tx *types.UnifiedTransaction, logIdx, swapIdx int64) *model.Transaction {
+func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, tx *types.UnifiedTransaction, logIdx, swapIdx int64) (*model.Transaction, []model.SwapRecord) {
 	if len(log.Data) < 128 {
 		u.GetLogger().WithField("tx_hash", tx.TxHash).Warn("V2 swap log data too short")
-		return nil
+		return nil, nil
 	}
 
 	amount0In := new(big.Int).SetBytes(log.Data[0:32])
@@ -688,12 +1052,26 @@ func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, t
 	price := dex.CalcPrice(amountIn, amountOut)
 	value := dex.CalcValue(amountIn, price)
 
+	// Per-token raw amount/side, independent of whether the pool is
+	// known — needed either to build SwapRecords immediately (pool known)
+	// or to enqueue a pendingqueue.Message carrying exactly this (pool
+	// unknown), so the worker doesn't need to re-parse the log later.
+	amt0, side0 := amount0In, model.SideIn
+	if amount0In.Sign() == 0 {
+		amt0, side0 = amount0Out, model.SideOut
+	}
+	amt1, side1 := amount1In, model.SideIn
+	if amount1In.Sign() == 0 {
+		amt1, side1 = amount1Out, model.SideOut
+	}
+
 	// Side (buy/sell) classification is independent of decimals — it only
 	// needs to know *which* token was paid in, not how many decimals it
 	// has — so this still uses the cache-only resolvePoolTokens (no
 	// eth_call) rather than being removed along with the normalization
 	// logic above.
 	side := "swap" // fallback when pool token addresses are unknown
+	var swapRecords []model.SwapRecord
 	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
 		var tokenIn, tokenOut string
 		if token0IsIn {
@@ -702,9 +1080,28 @@ func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, t
 			tokenIn, tokenOut = pm.token1, pm.token0
 		}
 		side = u.determineSide(tokenIn, tokenOut)
+
+		swapRecords = buildSwapRecords("uniswap_v2", poolAddr, tx.TxHash, dex.GetBlockNumber(tx), uint64(tx.Timestamp.Unix()), logIdx,
+			pm.token0, pm.token1, amt0, side0, amt1, side1)
+	} else if u.pendingQueue != nil {
+		msg := pendingqueue.Message{
+			PoolAddr:    poolAddr,
+			Protocol:    "uniswap_v2",
+			TxHash:      tx.TxHash,
+			BlockNumber: dex.GetBlockNumber(tx),
+			BlockTime:   uint64(tx.Timestamp.Unix()),
+			LogIndex:    logIdx,
+			Amount0:     amt0,
+			Side0:       side0,
+			Amount1:     amt1,
+			Side1:       side1,
+		}
+		if err := u.pendingQueue.Enqueue(ctx, msg); err != nil {
+			u.GetLogger().Debugf("pending queue enqueue failed for pool %s: %v", poolAddr, err)
+		}
 	}
 
-	return &model.Transaction{
+	txModel := &model.Transaction{
 		Addr:        poolAddr,
 		Router:      tx.ToAddress,
 		Factory:     uniswapV2FactoryAddr,
@@ -726,13 +1123,14 @@ func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, t
 			Type:       "swap",
 		},
 	}
+	return txModel, swapRecords
 }
 
 // parseV3Swap parses V3 Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)
-func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, tx *types.UnifiedTransaction, logIdx, swapIdx int64) *model.Transaction {
+func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, tx *types.UnifiedTransaction, logIdx, swapIdx int64) (*model.Transaction, []model.SwapRecord) {
 	if len(log.Data) < 160 {
 		u.GetLogger().WithField("tx_hash", tx.TxHash).Warn("V3 swap log data too short")
-		return nil
+		return nil, nil
 	}
 
 	// V3 Swap amounts are signed int256:
@@ -759,8 +1157,19 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 	price := dex.CalcV3Price(sqrtPriceX96)
 	value := dex.CalcValue(amountIn, price)
 
+	// Per-token raw amount/side — see parseV2Swap's doc comment.
+	amt0, side0 := new(big.Int).Abs(amount0), model.SideIn
+	if amount0.Sign() < 0 {
+		side0 = model.SideOut
+	}
+	amt1, side1 := new(big.Int).Abs(amount1), model.SideIn
+	if amount1.Sign() < 0 {
+		side1 = model.SideOut
+	}
+
 	// Side classification doesn't need decimals — see parseV2Swap.
 	side := "swap"
+	var swapRecords []model.SwapRecord
 	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
 		var tokenIn, tokenOut string
 		if token0IsIn {
@@ -769,9 +1178,28 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 			tokenIn, tokenOut = pm.token1, pm.token0
 		}
 		side = u.determineSide(tokenIn, tokenOut)
+
+		swapRecords = buildSwapRecords("uniswap_v3", poolAddr, tx.TxHash, dex.GetBlockNumber(tx), uint64(tx.Timestamp.Unix()), logIdx,
+			pm.token0, pm.token1, amt0, side0, amt1, side1)
+	} else if u.pendingQueue != nil {
+		msg := pendingqueue.Message{
+			PoolAddr:    poolAddr,
+			Protocol:    "uniswap_v3",
+			TxHash:      tx.TxHash,
+			BlockNumber: dex.GetBlockNumber(tx),
+			BlockTime:   uint64(tx.Timestamp.Unix()),
+			LogIndex:    logIdx,
+			Amount0:     amt0,
+			Side0:       side0,
+			Amount1:     amt1,
+			Side1:       side1,
+		}
+		if err := u.pendingQueue.Enqueue(ctx, msg); err != nil {
+			u.GetLogger().Debugf("pending queue enqueue failed for pool %s: %v", poolAddr, err)
+		}
 	}
 
-	return &model.Transaction{
+	txModel := &model.Transaction{
 		Addr:        poolAddr,
 		Router:      tx.ToAddress,
 		Factory:     uniswapV3FactoryAddr,
@@ -793,6 +1221,7 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 			Type:       "swap",
 		},
 	}
+	return txModel, swapRecords
 }
 
 // parseLiquidity parses V2/V3 Mint/Burn events

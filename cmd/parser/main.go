@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,9 +23,11 @@ import (
 	dex "unified-tx-parser/internal/parser/dexs"
 	dexfactory "unified-tx-parser/internal/parser/dexs/factory"
 	"unified-tx-parser/internal/parser/engine"
+	"unified-tx-parser/internal/pendingqueue"
 	"unified-tx-parser/internal/types"
 
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -292,6 +295,33 @@ func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types
 		}
 	}
 
+	// Shared across every extractor that wants one — a single pending
+	// queue + worker per process, not one per extractor instance, since
+	// they'd otherwise each spin up their own worker goroutine consuming
+	// from an entirely separate queue for no benefit (pool resolution
+	// isn't extractor-specific state). 5000 messages / 10 min max age /
+	// 5 attempts are conservative defaults for "new pool creation is
+	// inherently rare" — see pendingqueue.NewMemory's doc comment.
+	pq := pendingqueue.NewMemory(5000, 10*time.Minute, 5, 500*time.Millisecond)
+
+	// Shared rate limiter for every eth_call this package's extractors
+	// make outside the normal block-scanning path (token metadata
+	// resolution at pool-creation time, and the pending-queue worker's
+	// pool resolution) — one combined RPS budget, not one per call site,
+	// so a burst of new pools + new tokens at once (e.g. catching up a
+	// backlog) can't add up to more than the RPC node tolerates even
+	// though each individual call site is well-behaved on its own.
+	// 10 req/s with a burst of 10 is a conservative default for a public/
+	// shared RPC endpoint — tune via CP_ETH_RPC_RATE_LIMIT if the node
+	// backing this deployment can take more.
+	rpsLimit := 10.0
+	if v := os.Getenv("CP_ETH_RPC_RATE_LIMIT"); v != "" {
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed > 0 {
+			rpsLimit = parsed
+		}
+	}
+	rateLimiter := rate.NewLimiter(rate.Limit(rpsLimit), int(rpsLimit))
+
 	factory := dexfactory.CreateFactoryWithConfig(protocolsCfg)
 	for _, extractor := range factory.GetAllExtractors() {
 		if setter, ok := extractor.(dex.QuoteAssetSetter); ok && len(quoteAssets) > 0 {
@@ -311,6 +341,21 @@ func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types
 			SetTokenCacheRedis(*redis.Client)
 		}); ok && redisClient != nil {
 			setter.SetTokenCacheRedis(redisClient)
+		}
+		if setter, ok := extractor.(interface {
+			SetStorageEngine(types.StorageEngine)
+		}); ok && storage != nil {
+			setter.SetStorageEngine(storage)
+		}
+		if setter, ok := extractor.(interface {
+			SetPendingQueue(pendingqueue.Queue)
+		}); ok {
+			setter.SetPendingQueue(pq)
+		}
+		if setter, ok := extractor.(interface {
+			SetRateLimiter(*rate.Limiter)
+		}); ok {
+			setter.SetRateLimiter(rateLimiter)
 		}
 		eng.RegisterDexExtractor(extractor)
 	}
