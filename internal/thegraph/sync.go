@@ -9,6 +9,7 @@ import (
 
 	"unified-tx-parser/internal/config"
 	"unified-tx-parser/internal/dexcache"
+	"unified-tx-parser/internal/model"
 	"unified-tx-parser/internal/types"
 
 	"github.com/redis/go-redis/v9"
@@ -158,18 +159,33 @@ func (s *Syncer) syncVersion(ctx context.Context, protocol string, fetch fetchFu
 			return fmt.Errorf("store page %d (%d pools / %d tokens): %w", page, len(pr.Pools), len(pr.Tokens), err)
 		}
 
-		// Best-effort — dexcache's functions are nil-safe (no-op when
-		// s.redisClient is nil) and never return an error, matching this
-		// package's general posture that Redis is an acceleration layer,
-		// not a source of truth. A cache miss here just means the next
-		// consumer falls through to its own resolution path, same as if
-		// this sync had never run.
+		// Pipelined batch write (WarmTokens/WarmPools), not a per-item
+		// CacheToken/CachePool loop — a page can carry up to 1000 pools
+		// and a similar number of tokens, and CacheToken/CachePool each
+		// cost 2 Redis round trips (HSet + Expire). Looping that
+		// individually over ~1800 items measured at ~85-90s per page in
+		// practice (roughly matches ~1800 items × 2 round trips × ~25ms/
+		// round trip) — almost entirely spent here, not in StoreDexData
+		// or SetCursor either side of this block. WarmTokens/WarmPools
+		// batch everything into pipelined Exec calls instead, the same
+		// fix already applied to the startup warmup path for the same
+		// reason (see cmd/parser's warmRedisCacheAsync).
+		//
+		// Still best-effort — nil-safe on a nil client, errors logged not
+		// returned, same posture as CacheToken/CachePool. A cache miss
+		// here just means the next consumer falls through to its own
+		// resolution path, same as if this sync had never run.
+		tokenMap := make(map[string]model.Token, len(pr.Tokens))
 		for _, t := range pr.Tokens {
-			dexcache.CacheToken(ctx, s.redisClient, t)
+			tokenMap[t.Addr] = t
 		}
+		dexcache.WarmTokens(ctx, s.redisClient, tokenMap)
+
+		poolMap := make(map[string]model.Pool, len(pr.Pools))
 		for _, p := range pr.Pools {
-			dexcache.CachePool(ctx, s.redisClient, p)
+			poolMap[p.Addr] = p
 		}
+		dexcache.WarmPools(ctx, s.redisClient, poolMap)
 
 		cursorValue := formatCursor(pr.LastTimestamp, pr.LastID)
 		if err := s.cursors.SetCursor(ctx, source, s.chainType, protocol, cursorKey, cursorValue); err != nil {
