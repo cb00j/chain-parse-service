@@ -108,11 +108,15 @@ type poolMeta struct {
 // thegraph-sync pass, or warmup), with no backfill needed for the swaps
 // that came before that.
 //
-// TokenDecimals is always left nil — this codebase normalizes at read
-// time (joining against dex_tokens.decimals), never at write time, so
-// there's nothing to resolve or backfill here.
+// decimals0/decimals1 are opportunistic, not required: nil means
+// "unresolved, read time can join against dex_tokens for it" (see
+// model.SwapRecord's doc comment) — this function never triggers a
+// lookup to fill them in, callers pass whatever they already have on
+// hand for free (a cache hit, or a resolution they just did anyway for
+// other reasons) and nil otherwise.
 func buildSwapRecords(protocol, poolAddr, txHash string, blockNumber int64, blockTime uint64, logIndex int64,
-	token0, token1 string, amount0 *big.Int, side0 model.SwapRecordSide, amount1 *big.Int, side1 model.SwapRecordSide) []model.SwapRecord {
+	token0, token1 string, amount0 *big.Int, side0 model.SwapRecordSide, decimals0 *int,
+	amount1 *big.Int, side1 model.SwapRecordSide, decimals1 *int) []model.SwapRecord {
 	return []model.SwapRecord{
 		{
 			TokenAddr:       token0,
@@ -122,6 +126,7 @@ func buildSwapRecords(protocol, poolAddr, txHash string, blockNumber int64, bloc
 			Side:            side0,
 			TxHash:          txHash,
 			RawAmount:       amount0,
+			TokenDecimals:   decimals0,
 			PairedTokenAddr: token1,
 			BlockNumber:     blockNumber,
 			BlockTime:       blockTime,
@@ -135,6 +140,7 @@ func buildSwapRecords(protocol, poolAddr, txHash string, blockNumber int64, bloc
 			Side:            side1,
 			TxHash:          txHash,
 			RawAmount:       amount1,
+			TokenDecimals:   decimals1,
 			PairedTokenAddr: token0,
 			BlockNumber:     blockNumber,
 			BlockTime:       blockTime,
@@ -462,6 +468,51 @@ type multicall3Result struct {
 	ReturnData []byte
 }
 
+// cachedTokenDecimals returns tokenAddr's decimals if it's already sitting
+// in the local memory cache, without touching Redis or eth_call — safe to
+// call from the hot path (parseV2Swap/parseV3Swap) for the same reason
+// resolvePoolTokens' cache-only lookups are: a pure map read, not I/O.
+// Returns nil on a cache miss; callers should treat that as "unresolved
+// for now," not retry via fetchTokenMeta (which would reintroduce the
+// Redis/eth_call cost this function exists to avoid on the hot path).
+// cachedTokenDecimals returns tokenAddr's decimals if it's resolvable
+// without an eth_call — checks local memory first, then Redis, same two
+// tiers (and same reasoning) as resolvePoolTokens' cache-only lookup:
+// both are bounded I/O (dexcache's Redis calls carry their own ~2s
+// timeout), not the unbounded RPC risk that keeps eth_call out of the
+// swap-parsing hot path entirely.
+//
+// This exists because relying on local-memory-only would silently miss a
+// real answer: a pool can become "known" via resolvePoolTokens' Redis-hit
+// branch without its tokens ever having been resolved by *this* process
+// (e.g. discovered by thegraph-sync, or resolved by a different process
+// sharing the same Redis) — in that case tokenCache never gets populated
+// for those tokens on its own, and TokenDecimals would stay nil forever
+// on every subsequent swap for that pool, not just this one, with nothing
+// left to ever go back and fill it in. Checking Redis closes that gap
+// using data that's often already sitting right there.
+//
+// A miss here still isn't a correctness problem for the caller — it just
+// means this particular SwapRecord row skips the write-time optimization
+// and a reader falls back to joining dex_tokens.decimals at read time,
+// same as always.
+func (u *UniswapExtractor) cachedTokenDecimals(ctx context.Context, tokenAddr string) *int {
+	if token, ok := u.tokenCache.Get(tokenAddr); ok {
+		d := token.Decimals
+		return &d
+	}
+
+	if u.redisClient != nil {
+		if token, ok := dexcache.GetToken(ctx, u.redisClient, tokenAddr); ok {
+			u.tokenCache.Set(tokenAddr, token) // backfill so the next call for this token hits the memory tier
+			d := token.Decimals
+			return &d
+		}
+	}
+
+	return nil
+}
+
 func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string) model.Token {
 	if cached, ok := u.tokenCache.Get(tokenAddr); ok {
 		return cached
@@ -686,6 +737,38 @@ func (u *UniswapExtractor) resolvePendingPool(ctx context.Context, poolAddr stri
 		dexcache.CachePool(ctx, u.redisClient, pool)
 	}
 
+	// Resolve token0/token1 metadata now too — this is the same "brand
+	// new, first time ever seen" moment as a scanned PairCreated/
+	// PoolCreated event, which already does exactly this (see
+	// ExtractDexData's pair_created/pool_created branches). A pool
+	// reaching this worker instead of that path (because its creation
+	// event was scanned before this process existed, or is outside
+	// start_block) shouldn't mean its tokens permanently never get
+	// resolved through the on-chain path — fetchTokenMeta already has
+	// its own memory/Redis short-circuit, so this only actually costs an
+	// eth_call for tokens that are also new to fetchTokenMeta.
+	//
+	// decimals0/decimals1 are captured alongside so buildSwapRecords below
+	// can fill SwapRecord.TokenDecimals directly — unlike the hot path
+	// (which only opportunistically peeks the cache via
+	// cachedTokenDecimals), this worker just resolved them synchronously
+	// one line above, so there's no reason to leave them nil and make a
+	// read-time join do work that's already sitting right here.
+	tokens := make([]model.Token, 0, 2)
+	var decimals0, decimals1 *int
+	if pm.token0 != "" {
+		t := u.fetchTokenMeta(ctx, pm.token0)
+		tokens = append(tokens, t)
+		d := t.Decimals
+		decimals0 = &d
+	}
+	if pm.token1 != "" {
+		t := u.fetchTokenMeta(ctx, pm.token1)
+		tokens = append(tokens, t)
+		d := t.Decimals
+		decimals1 = &d
+	}
+
 	if u.storage == nil {
 		u.GetLogger().Warnf("pool %s resolved but no storage engine wired — %d queued swap(s) will not get SwapRecord rows", poolAddr, len(msgs))
 		return nil
@@ -695,12 +778,13 @@ func (u *UniswapExtractor) resolvePendingPool(ctx context.Context, poolAddr stri
 	for _, msg := range msgs {
 		records = append(records, buildSwapRecords(
 			msg.Protocol, msg.PoolAddr, msg.TxHash, msg.BlockNumber, msg.BlockTime, msg.LogIndex,
-			pm.token0, pm.token1, msg.Amount0, msg.Side0, msg.Amount1, msg.Side1,
+			pm.token0, pm.token1, msg.Amount0, msg.Side0, decimals0, msg.Amount1, msg.Side1, decimals1,
 		)...)
 	}
 
 	if err := u.storage.StoreDexData(ctx, &types.DexData{
 		Pools:       []model.Pool{pool},
+		Tokens:      tokens,
 		SwapRecords: records,
 	}); err != nil {
 		return fmt.Errorf("store resolved pool %s + %d swap record(s): %w", poolAddr, len(records), err)
@@ -1082,7 +1166,7 @@ func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, t
 		side = u.determineSide(tokenIn, tokenOut)
 
 		swapRecords = buildSwapRecords("uniswap_v2", poolAddr, tx.TxHash, dex.GetBlockNumber(tx), uint64(tx.Timestamp.Unix()), logIdx,
-			pm.token0, pm.token1, amt0, side0, amt1, side1)
+			pm.token0, pm.token1, amt0, side0, u.cachedTokenDecimals(ctx, pm.token0), amt1, side1, u.cachedTokenDecimals(ctx, pm.token1))
 	} else if u.pendingQueue != nil {
 		msg := pendingqueue.Message{
 			PoolAddr:    poolAddr,
@@ -1180,7 +1264,7 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 		side = u.determineSide(tokenIn, tokenOut)
 
 		swapRecords = buildSwapRecords("uniswap_v3", poolAddr, tx.TxHash, dex.GetBlockNumber(tx), uint64(tx.Timestamp.Unix()), logIdx,
-			pm.token0, pm.token1, amt0, side0, amt1, side1)
+			pm.token0, pm.token1, amt0, side0, u.cachedTokenDecimals(ctx, pm.token0), amt1, side1, u.cachedTokenDecimals(ctx, pm.token1))
 	} else if u.pendingQueue != nil {
 		msg := pendingqueue.Message{
 			PoolAddr:    poolAddr,
