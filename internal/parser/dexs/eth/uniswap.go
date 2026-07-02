@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"unified-tx-parser/internal/dexcache"
 	"unified-tx-parser/internal/model"
 	dex "unified-tx-parser/internal/parser/dexs"
 	"unified-tx-parser/internal/types"
@@ -549,16 +550,34 @@ func (u *UniswapExtractor) resolvePoolTokens(ctx context.Context, poolAddr strin
 		}
 	}
 
+	// Redis layer: sits between the local seenPools cache and the disabled
+	// eth_call path below. A hit here means thegraph.Syncer (or a prior
+	// run's warmup) already resolved this pool's tokens — reuse it and
+	// backfill seenPools so subsequent swaps for the same pool skip Redis
+	// entirely, same pattern as fetchTokenMeta's Redis layer above. This
+	// is a cheap, bounded lookup (2s timeout inside dexcache, not the
+	// eth_call path's RPC round trip), so it stays safe to run on the hot
+	// path even though the eth_call fallback below had to be disabled.
+	if u.redisClient != nil {
+		if pool, ok := dexcache.GetPool(ctx, u.redisClient, poolAddr); ok {
+			if token0, token1 := pool.Tokens[0], pool.Tokens[1]; token0 != "" && token1 != "" {
+				pm := &poolMeta{token0: token0, token1: token1}
+				u.seenPools.Store(poolAddr, pm)
+				return pm
+			}
+		}
+	}
+
 	// Active eth_call resolution disabled (2026-06-30): under load, this was
 	// observed to cost tens of seconds per unresolved pool — RPC latency
 	// against the public node was high enough to stall the whole batch
 	// (one block batch took 81.4s, almost entirely waiting on a single
 	// pool's token0()/token1() calls). Until this is reworked to run off
 	// the synchronous extraction path (see TODO below), pools not already
-	// known via a scanned PairCreated/PoolCreated event or the startup
-	// warmup (WarmupPoolTokens) fall through to the raw-value fallback in
-	// parseV2Swap/parseV3Swap — same behavior as before resolvePoolTokens
-	// was introduced.
+	// known via a scanned PairCreated/PoolCreated event, the startup
+	// warmup (WarmupPoolTokens), or the Redis layer above fall through to
+	// the raw-value fallback in parseV2Swap/parseV3Swap — same behavior
+	// as before resolvePoolTokens was introduced.
 	//
 	// TODO: move this resolution off the hot path — e.g. queue unresolved
 	// pool addresses and resolve them concurrently in a background worker,
