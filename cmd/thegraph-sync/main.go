@@ -76,7 +76,17 @@ func main() {
 		log.Fatalf("cursor store init failed: %v", err)
 	}
 
-	syncer, err := thegraph.NewSyncer(cfg.TheGraph, chainType, storage, cursors)
+	// Redis is optional here (unlike cursors/storage) — a missing/down
+	// Redis just means dexcache writes are skipped (see NewSyncer), not a
+	// startup failure. This process's actual job (fetch subgraph data,
+	// persist to storage, advance the cursor) works fine without it.
+	redisClient := appinit.CreateRedisClient(cfg)
+	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+		log.Warnf("redis unavailable, dexcache write-through disabled: %v", err)
+		redisClient = nil
+	}
+
+	syncer, err := thegraph.NewSyncer(cfg.TheGraph, chainType, storage, cursors, redisClient)
 	if err != nil {
 		log.Fatalf("syncer init failed: %v", err)
 	}
@@ -147,8 +157,19 @@ func runLoop(cfg *config.Config, syncer *thegraph.Syncer) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Cancel ctx as soon as a shutdown signal arrives, rather than only
+	// checking for it between ticks. This is what makes it safe for
+	// syncOnceWithTimeout's per-sync budget to be generous (below): a long
+	// in-flight sync doesn't delay shutdown, because canceling ctx here
+	// immediately cancels whatever HTTP request Client.Query is currently
+	// waiting on (context.WithTimeout derives from this ctx).
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-quit
+		log.Info("shutdown signal received, stopping")
+		cancel()
+	}()
 
 	log.Infof("starting periodic sync loop (interval=%s)", interval)
 	syncOnceWithTimeout(ctx, syncer)
@@ -158,8 +179,7 @@ func runLoop(cfg *config.Config, syncer *thegraph.Syncer) {
 
 	for {
 		select {
-		case <-quit:
-			log.Info("shutdown signal received, stopping")
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			syncOnceWithTimeout(ctx, syncer)
@@ -170,8 +190,19 @@ func runLoop(cfg *config.Config, syncer *thegraph.Syncer) {
 // syncOnceWithTimeout bounds a single sync pass independently of the
 // interval, so a slow subgraph response can't stall the next tick
 // indefinitely.
+//
+// The budget is intentionally generous (30 min, not something tighter like
+// the interval itself) because a single sync pass may need to work through
+// many pages of a large backlog (e.g. an initial full Uniswap V2 backfill,
+// ~500 pages) rather than just a handful of new pools — and thanks to
+// per-page persistence in Syncer.syncVersion, a bigger budget only ever
+// helps throughput, it can't lose more than the one page in flight when it
+// does eventually run out. Safe to be generous here specifically because
+// runLoop's signal handler (above) can still cancel ctx immediately,
+// independent of this timeout, so shutdown responsiveness isn't traded
+// away for it.
 func syncOnceWithTimeout(parent context.Context, syncer *thegraph.Syncer) {
-	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 30*time.Minute)
 	defer cancel()
 
 	if err := syncer.SyncOnce(ctx); err != nil {

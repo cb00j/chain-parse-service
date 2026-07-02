@@ -469,6 +469,65 @@ func (s *SimpleInfluxDBStorage) GetAllPoolTokens(ctx context.Context) (map[strin
 	return out, nil
 }
 
+// GetAllPools returns addr -> full pool identity for every pool with known
+// token addresses recorded in dex_pools (same placeholder-pool exclusion
+// as GetAllPoolTokens — see its doc comment). protocol/factory/source are
+// tags; fee is the only field needed to identify a pool, so this groups on
+// all the tag columns and takes fee's last() value, consistent with how
+// GetAllTokenMeta reads decimals.
+func (s *SimpleInfluxDBStorage) GetAllPools(ctx context.Context) (map[string]model.Pool, error) {
+	query := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: -365d)
+		|> filter(fn: (r) => r._measurement == "dex_pools")
+		|> filter(fn: (r) => r._field == "fee")
+		|> group(columns: ["addr", "protocol", "factory", "token_0", "token_1", "source"])
+		|> last()
+		|> group()
+		|> keep(columns: ["addr", "protocol", "factory", "token_0", "token_1", "source", "_value"])
+	`, s.config.Bucket)
+
+	result, err := s.queryAPI.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query all pools: %w", err)
+	}
+	defer result.Close()
+
+	out := make(map[string]model.Pool)
+	for result.Next() {
+		rec := result.Record()
+		addr, _ := rec.ValueByKey("addr").(string)
+		token0, _ := rec.ValueByKey("token_0").(string)
+		token1, _ := rec.ValueByKey("token_1").(string)
+		if addr == "" || token0 == "" || token1 == "" {
+			continue // skip placeholder pools with unresolved tokens
+		}
+		protocol, _ := rec.ValueByKey("protocol").(string)
+		factory, _ := rec.ValueByKey("factory").(string)
+		source, _ := rec.ValueByKey("source").(string)
+
+		pool := model.Pool{
+			Addr:     addr,
+			Factory:  factory,
+			Protocol: protocol,
+			Tokens:   map[int]string{0: token0, 1: token1},
+			Source:   model.PoolSource(source),
+		}
+		switch v := rec.Value().(type) {
+		case int64:
+			pool.Fee = int(v)
+		case float64:
+			pool.Fee = int(v)
+		}
+
+		out[addr] = pool
+	}
+	if result.Err() != nil {
+		return nil, fmt.Errorf("read all pools: %w", result.Err())
+	}
+	return out, nil
+}
+
 // GetAllTokenMeta returns addr -> decimals for every token recorded in
 // dex_tokens. decimals is a field (not a tag), so this groups by addr and
 // takes the latest value — token decimals never change once minted, but

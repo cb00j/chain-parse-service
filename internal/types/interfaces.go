@@ -144,6 +144,14 @@ type StorageEngine interface {
 	// pools that were already resolved before the restart.
 	GetAllPoolTokens(ctx context.Context) (map[string][2]string, error)
 
+	// GetAllPools returns addr -> full pool identity (factory, protocol,
+	// token0, token1, fee, source) for every pool in dex_pools. Unlike
+	// GetAllPoolTokens, this carries every field needed to fully
+	// reconstruct a model.Pool — used at startup to warm the Redis pool
+	// cache (internal/dexcache), which needs more than just token
+	// addresses to be useful as a lookup cache.
+	GetAllPools(ctx context.Context) (map[string]model.Pool, error)
+
 	// GetAllTokenMeta returns addr -> full token metadata (decimals, symbol,
 	// name) for every token recorded in dex_tokens. dex_tokens is the
 	// authoritative, persistent source for token metadata; this is used at

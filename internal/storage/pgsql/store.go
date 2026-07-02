@@ -643,6 +643,36 @@ func (p *PgSQLStore) GetAllPoolTokens(ctx context.Context) (map[string][2]string
 	return out, rows.Err()
 }
 
+// GetAllPools returns addr -> full pool identity for every pool in
+// dex_pools — see the MySQL implementation's doc comment for why this
+// exists alongside GetAllPoolTokens.
+func (p *PgSQLStore) GetAllPools(ctx context.Context) (map[string]model.Pool, error) {
+	rows, err := p.db.QueryContext(ctx, `SELECT addr, factory, protocol, token0, token1, fee, source FROM dex_pools`)
+	if err != nil {
+		return nil, fmt.Errorf("query all pools: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]model.Pool)
+	for rows.Next() {
+		var addr, factory, protocol, source sql.NullString
+		var token0, token1 sql.NullString
+		var fee int
+		if err := rows.Scan(&addr, &factory, &protocol, &token0, &token1, &fee, &source); err != nil {
+			continue
+		}
+		out[addr.String] = model.Pool{
+			Addr:     addr.String,
+			Factory:  factory.String,
+			Protocol: protocol.String,
+			Tokens:   map[int]string{0: token0.String, 1: token1.String},
+			Fee:      fee,
+			Source:   model.PoolSource(source.String),
+		}
+	}
+	return out, rows.Err()
+}
+
 // GetAllTokenMeta returns addr -> decimals for every token in
 // dex_tokens. Used at startup to warm up the in-memory token cache so a
 // process restart doesn't re-derive decimals for tokens already resolved

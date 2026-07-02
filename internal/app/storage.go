@@ -71,6 +71,24 @@ func CreateStorageEngine(cfg *config.Config) (types.StorageEngine, error) {
 	}
 }
 
+// CreateRedisClient builds a *redis.Client from cfg.Redis without any of
+// the progress-tracker machinery CreateProgressTracker pulls in (DB
+// fallback tracker, health-check goroutine, etc.) — for callers that just
+// need a plain Redis connection, e.g. cmd/thegraph-sync wiring one into
+// dexcache. Does not ping/verify connectivity; callers that care should
+// call client.Ping themselves (mirroring CreateProgressTracker's own
+// "Redis is optional, degrade gracefully" stance — a nil-safe caller
+// doesn't need this to fail loudly here).
+func CreateRedisClient(cfg *config.Config) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:       fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
+		Password:   cfg.Redis.Password,
+		DB:         cfg.Redis.DB,
+		PoolSize:   cfg.Redis.PoolSize,
+		MaxRetries: cfg.Redis.MaxRetries,
+	})
+}
+
 // CreateProgressTracker creates a FallbackProgressTracker:
 //   - primary:   Redis (fast, real-time)
 //   - secondary: DB    (durable, synced every syncInterval batches)

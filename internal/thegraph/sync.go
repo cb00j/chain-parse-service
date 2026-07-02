@@ -8,8 +8,10 @@ import (
 	"strings"
 
 	"unified-tx-parser/internal/config"
+	"unified-tx-parser/internal/dexcache"
 	"unified-tx-parser/internal/types"
 
+	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -50,11 +52,25 @@ type Syncer struct {
 
 	storage types.StorageEngine
 	cursors types.CursorStore
+
+	// redisClient is optional — nil disables the dexcache write-through
+	// entirely (dexcache's functions are all nil-safe). See NewSyncer.
+	redisClient *redis.Client
 }
 
 // NewSyncer creates a Syncer. At least one of cfg.V2Endpoint/V3Endpoint
 // must be set, or every SyncOnce call is a no-op.
-func NewSyncer(cfg config.TheGraphConfig, chainType string, storage types.StorageEngine, cursors types.CursorStore) (*Syncer, error) {
+//
+// redisClient is optional (nil disables it) — when set, every page
+// successfully written to storage is also written to dexcache
+// (internal/dexcache), giving on-chain extractors (e.g. UniswapExtractor's
+// token metadata lookup) a Redis hit instead of falling through to an
+// eth_call/DB query for anything this sync already resolved. Passed as a
+// constructor param rather than a setter (contrast
+// UniswapExtractor.SetTokenCacheRedis) because Syncer has no
+// registration-phase lifecycle to hook into — it's just constructed once
+// in cmd/thegraph-sync's main.
+func NewSyncer(cfg config.TheGraphConfig, chainType string, storage types.StorageEngine, cursors types.CursorStore, redisClient *redis.Client) (*Syncer, error) {
 	if storage == nil {
 		return nil, fmt.Errorf("thegraph: storage engine is required")
 	}
@@ -63,10 +79,11 @@ func NewSyncer(cfg config.TheGraphConfig, chainType string, storage types.Storag
 	}
 
 	s := &Syncer{
-		chainType: chainType,
-		cfg:       cfg,
-		storage:   storage,
-		cursors:   cursors,
+		chainType:   chainType,
+		cfg:         cfg,
+		storage:     storage,
+		cursors:     cursors,
+		redisClient: redisClient,
 	}
 
 	if cfg.V2Endpoint != "" {
@@ -139,6 +156,19 @@ func (s *Syncer) syncVersion(ctx context.Context, protocol string, fetch fetchFu
 
 		if err := s.storage.StoreDexData(ctx, &types.DexData{Pools: pr.Pools, Tokens: pr.Tokens}); err != nil {
 			return fmt.Errorf("store page %d (%d pools / %d tokens): %w", page, len(pr.Pools), len(pr.Tokens), err)
+		}
+
+		// Best-effort — dexcache's functions are nil-safe (no-op when
+		// s.redisClient is nil) and never return an error, matching this
+		// package's general posture that Redis is an acceleration layer,
+		// not a source of truth. A cache miss here just means the next
+		// consumer falls through to its own resolution path, same as if
+		// this sync had never run.
+		for _, t := range pr.Tokens {
+			dexcache.CacheToken(ctx, s.redisClient, t)
+		}
+		for _, p := range pr.Pools {
+			dexcache.CachePool(ctx, s.redisClient, p)
 		}
 
 		cursorValue := formatCursor(pr.LastTimestamp, pr.LastID)

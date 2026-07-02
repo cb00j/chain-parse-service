@@ -12,6 +12,7 @@ import (
 
 	appinit "unified-tx-parser/internal/app"
 	"unified-tx-parser/internal/config"
+	"unified-tx-parser/internal/dexcache"
 	"unified-tx-parser/internal/logger"
 	"unified-tx-parser/internal/model"
 	"unified-tx-parser/internal/parser/chains/bsc"
@@ -268,6 +269,29 @@ func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types
 		}
 	}
 
+	// Redis cache warmup runs in the background, not on the startup path.
+	// It exists purely to help *other* consumers (a future restart of this
+	// same process, or any other process that reads dexcache without its
+	// own DB-backed warmup) — it has zero effect on this process's own hot
+	// path, since fetchTokenMeta always checks the in-memory cache (just
+	// warmed synchronously above) before ever touching Redis. Blocking
+	// engine startup on filling Redis with 500k+ entries was purely wasted
+	// wall-clock time from this process's own perspective — see
+	// warmRedisCacheAsync for what actually runs and cmd/thegraph-sync's
+	// own dexcache writes for the other place this cache gets filled.
+	//
+	// GetAllPools (unlike GetAllPoolTokens/GetAllTokenMeta above) has no
+	// synchronous consumer at all — nothing needs it before the engine can
+	// start — so its DB read moves into the background too, not just the
+	// Redis write.
+	if redisClient != nil {
+		if dexcache.IsWarmed(context.Background(), redisClient) {
+			log.Info("redis dexcache already warmed recently — skipping bulk warmup (per-item TTLs still fresh)")
+		} else {
+			go warmRedisCacheAsync(storage, redisClient, tokenMeta)
+		}
+	}
+
 	factory := dexfactory.CreateFactoryWithConfig(protocolsCfg)
 	for _, extractor := range factory.GetAllExtractors() {
 		if setter, ok := extractor.(dex.QuoteAssetSetter); ok && len(quoteAssets) > 0 {
@@ -291,6 +315,64 @@ func registerDexExtractors(eng *engine.Engine, cfg *config.Config, storage types
 		eng.RegisterDexExtractor(extractor)
 	}
 	return nil
+}
+
+// warmRedisCacheAsync fills dexcache (Redis) with every known token and
+// pool from storage. Called as its own goroutine from
+// registerDexExtractors — see the call site for why this must never be on
+// the startup path. Uses its own long-lived background context rather than
+// one tied to registerDexExtractors' stack frame, since by the time this
+// runs, that function has already returned and the engine may already be
+// processing blocks.
+//
+// tokenMeta is passed in (already fetched synchronously for the in-memory
+// warmup) to avoid a second identical DB query; pools has no such
+// synchronous counterpart, so it's queried fresh here.
+func warmRedisCacheAsync(storage types.StorageEngine, redisClient *redis.Client, tokenMeta map[string]model.Token) {
+	start := time.Now()
+	// defer, not a call at the end of the happy path: every early return
+	// below (storage nil, query failure, no pools) is still "a warmup ran"
+	// from the marker's point of view — a failed/partial attempt
+	// shouldn't force every subsequent restart to redundantly retry the
+	// same thing. Individual cache misses still fall through to their
+	// normal resolution path regardless of whether the marker is set.
+	defer dexcache.MarkWarmed(context.Background(), redisClient)
+
+	if len(tokenMeta) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		failed := dexcache.WarmTokens(ctx, redisClient, tokenMeta)
+		cancel()
+		if failed > 0 {
+			log.Warnf("[warmup] redis token cache: %d/%d entries cached, %d failed", len(tokenMeta)-failed, len(tokenMeta), failed)
+		} else {
+			log.Infof("[warmup] redis token cache warmed with %d entries", len(tokenMeta))
+		}
+	}
+
+	if storage == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pools, err := storage.GetAllPools(ctx)
+	cancel()
+	if err != nil {
+		log.Warnf("[warmup] pool cache query failed (non-fatal, will fill in as pools are synced/discovered): %v", err)
+		return
+	}
+	if len(pools) == 0 {
+		return
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
+	failed := dexcache.WarmPools(ctx, redisClient, pools)
+	cancel()
+	if failed > 0 {
+		log.Warnf("[warmup] redis pool cache: %d/%d entries cached, %d failed", len(pools)-failed, len(pools), failed)
+	} else {
+		log.Infof("[warmup] redis pool cache warmed with %d entries", len(pools))
+	}
+
+	log.Infof("[warmup] redis cache warmup finished in %s", time.Since(start).Round(time.Second))
 }
 
 func buildQuoteAssetsMap(cfg *config.Config) map[string]int {
