@@ -333,16 +333,55 @@ var erc20ABI, _ = abi.JSON(strings.NewReader(`[
 	{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"}
 ]`))
 
-// poolABI is the minimal ABI needed to call token0()/token1() on a V2/V3 pool contract.
-// Both methods exist on every Uniswap V2 pair and V3 pool from the moment the contract
-// is deployed — unlike PairCreated/PoolCreated, they don't require having scanned the
-// block where the pool was created. This lets fallback paths resolve token addresses
-// for a pool encountered out of event order (e.g. its first swap was scanned before
-// its creation event), instead of falling back to raw, unnormalized price/value.
-var poolABI, _ = abi.JSON(strings.NewReader(`[
-	{"constant":true,"inputs":[],"name":"token0","outputs":[{"name":"","type":"address"}],"type":"function"},
-	{"constant":true,"inputs":[],"name":"token1","outputs":[{"name":"","type":"address"}],"type":"function"}
-]`))
+// multicall3Address is the Multicall3 contract's deployment address — the
+// same address on virtually every EVM chain (Ethereum mainnet included),
+// since it's deployed via a deterministic CREATE2 factory. See
+// https://www.multicall3.com/ for the deployment list.
+const multicall3Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
+
+// multicall3ABI only declares aggregate3 — the one function this package
+// needs. allowFailure=true per call means one bad token (missing name(),
+// reverting, whatever) doesn't sink the other calls in the same batch;
+// each result carries its own Success flag instead.
+var multicall3ABI, _ = abi.JSON(strings.NewReader(`[{
+	"inputs": [{
+		"components": [
+			{"internalType": "address", "name": "target", "type": "address"},
+			{"internalType": "bool", "name": "allowFailure", "type": "bool"},
+			{"internalType": "bytes", "name": "callData", "type": "bytes"}
+		],
+		"internalType": "struct Multicall3.Call3[]",
+		"name": "calls",
+		"type": "tuple[]"
+	}],
+	"name": "aggregate3",
+	"outputs": [{
+		"components": [
+			{"internalType": "bool", "name": "success", "type": "bool"},
+			{"internalType": "bytes", "name": "returnData", "type": "bytes"}
+		],
+		"internalType": "struct Multicall3.Result[]",
+		"name": "returnData",
+		"type": "tuple[]"
+	}],
+	"stateMutability": "payable",
+	"type": "function"
+}]`))
+
+// multicall3Call / multicall3Result mirror aggregate3's Call3/Result tuple
+// components — struct field names must match the ABI component names
+// (capitalized) for go-ethereum's abi package to pack/unpack them via
+// reflection; field order must match the ABI too.
+type multicall3Call struct {
+	Target       common.Address
+	AllowFailure bool
+	CallData     []byte
+}
+
+type multicall3Result struct {
+	Success    bool
+	ReturnData []byte
+}
 
 func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string) model.Token {
 	if cached, ok := u.tokenCache.Get(tokenAddr); ok {
@@ -377,38 +416,46 @@ func (u *UniswapExtractor) fetchTokenMeta(ctx context.Context, tokenAddr string)
 
 	addr := common.HexToAddress(tokenAddr)
 
-	// decimals()
-	if data, err := erc20ABI.Pack("decimals"); err == nil {
-		var result []byte
-		msg := ethereum.CallMsg{To: &addr, Data: data}
-		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
-			result = out
+	// One RPC round trip for all three fields, via Multicall3, instead of
+	// three sequential eth_calls. Under load against a public RPC node,
+	// each individual eth_call round trip is where the latency actually
+	// goes (not the ABI encode/decode) — collapsing decimals()/symbol()/
+	// name() into a single aggregate3 call cuts that 3x down to 1x, which
+	// matters a lot when this runs for every never-before-seen token.
+	decimalsData, decErr := erc20ABI.Pack("decimals")
+	symbolData, symErr := erc20ABI.Pack("symbol")
+	nameData, nameErr := erc20ABI.Pack("name")
+
+	if decErr == nil && symErr == nil && nameErr == nil {
+		calls := []multicall3Call{
+			{Target: addr, AllowFailure: true, CallData: decimalsData},
+			{Target: addr, AllowFailure: true, CallData: symbolData},
+			{Target: addr, AllowFailure: true, CallData: nameData},
 		}
 
-		if len(result) >= 32 {
-			token.Decimals = int(new(big.Int).SetBytes(result[len(result)-32:]).Uint64())
-		}
-	}
-
-	// symbol()
-	if data, err := erc20ABI.Pack("symbol"); err == nil {
-		msg := ethereum.CallMsg{To: &addr, Data: data}
-		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
-			if vals, err := erc20ABI.Unpack("symbol", out); err == nil && len(vals) > 0 {
-				if s, ok := vals[0].(string); ok {
-					token.Symbol = s
-				}
-			}
-		}
-	}
-
-	// name()
-	if data, err := erc20ABI.Pack("name"); err == nil {
-		msg := ethereum.CallMsg{To: &addr, Data: data}
-		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
-			if vals, err := erc20ABI.Unpack("name", out); err == nil && len(vals) > 0 {
-				if s, ok := vals[0].(string); ok {
-					token.Name = s
+		if packed, err := multicall3ABI.Pack("aggregate3", calls); err == nil {
+			mcAddr := common.HexToAddress(multicall3Address)
+			msg := ethereum.CallMsg{To: &mcAddr, Data: packed}
+			if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
+				var results []multicall3Result
+				if err := multicall3ABI.UnpackIntoInterface(&results, "aggregate3", out); err == nil && len(results) == 3 {
+					if r := results[0]; r.Success && len(r.ReturnData) >= 32 {
+						token.Decimals = int(new(big.Int).SetBytes(r.ReturnData[len(r.ReturnData)-32:]).Uint64())
+					}
+					if r := results[1]; r.Success {
+						if vals, err := erc20ABI.Unpack("symbol", r.ReturnData); err == nil && len(vals) > 0 {
+							if s, ok := vals[0].(string); ok {
+								token.Symbol = s
+							}
+						}
+					}
+					if r := results[2]; r.Success {
+						if vals, err := erc20ABI.Unpack("name", r.ReturnData); err == nil && len(vals) > 0 {
+							if s, ok := vals[0].(string); ok {
+								token.Name = s
+							}
+						}
+					}
 				}
 			}
 		}
@@ -556,8 +603,10 @@ func (u *UniswapExtractor) resolvePoolTokens(ctx context.Context, poolAddr strin
 	// backfill seenPools so subsequent swaps for the same pool skip Redis
 	// entirely, same pattern as fetchTokenMeta's Redis layer above. This
 	// is a cheap, bounded lookup (2s timeout inside dexcache, not the
-	// eth_call path's RPC round trip), so it stays safe to run on the hot
-	// path even though the eth_call fallback below had to be disabled.
+	// eth_call path's RPC round trip), so it's always worth trying before
+	// falling through to eth_call below — a Redis hit means this pool has
+	// been resolved before (by any process), so we skip an RPC call
+	// entirely for anything except a genuinely first-ever-seen pool.
 	if u.redisClient != nil {
 		if pool, ok := dexcache.GetPool(ctx, u.redisClient, poolAddr); ok {
 			if token0, token1 := pool.Tokens[0], pool.Tokens[1]; token0 != "" && token1 != "" {
@@ -568,66 +617,19 @@ func (u *UniswapExtractor) resolvePoolTokens(ctx context.Context, poolAddr strin
 		}
 	}
 
-	// Active eth_call resolution disabled (2026-06-30): under load, this was
-	// observed to cost tens of seconds per unresolved pool — RPC latency
-	// against the public node was high enough to stall the whole batch
-	// (one block batch took 81.4s, almost entirely waiting on a single
-	// pool's token0()/token1() calls). Until this is reworked to run off
-	// the synchronous extraction path (see TODO below), pools not already
-	// known via a scanned PairCreated/PoolCreated event, the startup
-	// warmup (WarmupPoolTokens), or the Redis layer above fall through to
-	// the raw-value fallback in parseV2Swap/parseV3Swap — same behavior
-	// as before resolvePoolTokens was introduced.
-	//
-	// TODO: move this resolution off the hot path — e.g. queue unresolved
-	// pool addresses and resolve them concurrently in a background worker,
-	// so a slow/unavailable RPC node degrades data quality for one batch
-	// instead of stalling block processing. See registerDexExtractors'
-	// WarmupPoolTokens call for the cache this would feed into.
+	// No eth_call here. Unlike token decimals (which genuinely can't be
+	// known without either an eth_call or a prior subgraph sync), a
+	// pool's token0/token1 addresses are always available for free from
+	// the PairCreated/PoolCreated event itself — see parseV2PairCreated/
+	// parseV3PoolCreated, which populate seenPools directly from the log,
+	// zero RPC calls. So a pool reaching this point (miss on both
+	// seenPools and Redis) means its creation event hasn't been scanned
+	// yet (e.g. it predates this process's start_block and hasn't been
+	// backfilled by thegraph-sync/warmup) — there's nothing to eth_call
+	// for the tokens; token0()/token1() would just tell us what the event
+	// log will tell us for free once it's actually scanned. Swaps for
+	// such a pool fall through to the raw-value fallback until then.
 	return nil
-}
-
-func (u *UniswapExtractor) resolvePoolTokensViaEthCall(ctx context.Context, poolAddr string) *poolMeta {
-	if u.ethClient == nil {
-		return nil
-	}
-
-	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	addr := common.HexToAddress(poolAddr)
-
-	var token0, token1 string
-
-	if data, err := poolABI.Pack("token0"); err == nil {
-		msg := ethereum.CallMsg{To: &addr, Data: data}
-		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
-			if vals, err := poolABI.Unpack("token0", out); err == nil && len(vals) > 0 {
-				if a, ok := vals[0].(common.Address); ok {
-					token0 = a.Hex()
-				}
-			}
-		}
-	}
-	if data, err := poolABI.Pack("token1"); err == nil {
-		msg := ethereum.CallMsg{To: &addr, Data: data}
-		if out, err := u.ethClient.CallContract(callCtx, msg, nil); err == nil {
-			if vals, err := poolABI.Unpack("token1", out); err == nil && len(vals) > 0 {
-				if a, ok := vals[0].(common.Address); ok {
-					token1 = a.Hex()
-				}
-			}
-		}
-	}
-
-	if token0 == "" || token1 == "" {
-		// eth_call failed (e.g. not a standard V2/V3 pool, or RPC error).
-		// Leave seenPools untouched so a later call can retry.
-		return nil
-	}
-
-	pm := &poolMeta{token0: token0, token1: token1}
-	u.seenPools.Store(poolAddr, pm)
-	return pm
 }
 
 // lazyPool 在 seenPools 缓存里没有这个地址时,产出一条最小 Pool 记录并缓存。
@@ -677,44 +679,29 @@ func (u *UniswapExtractor) parseV2Swap(ctx context.Context, log *ethtypes.Log, t
 
 	poolAddr := log.Address.Hex()
 
-	var price, value float64
+	// Price/Value are always computed from raw amounts — no decimals
+	// lookup, no normalization, regardless of whether this pool's tokens
+	// are known. This means Price/Value are in raw smallest-unit terms,
+	// not human-readable units; normalizing into a human-readable price
+	// is a read-time concern for whatever consumes this data (join
+	// against dex_tokens.decimals), not something resolved here.
+	price := dex.CalcPrice(amountIn, amountOut)
+	value := dex.CalcValue(amountIn, price)
+
+	// Side (buy/sell) classification is independent of decimals — it only
+	// needs to know *which* token was paid in, not how many decimals it
+	// has — so this still uses the cache-only resolvePoolTokens (no
+	// eth_call) rather than being removed along with the normalization
+	// logic above.
 	side := "swap" // fallback when pool token addresses are unknown
 	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
-		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
-		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
-
-		// price is always token1/token0, independent of buy/sell direction.
-		// Deriving it from amountIn/amountOut would flip depending on trade
-		// direction, producing reciprocal values for buys vs sells — the same
-		// class of bug fixed for V3 via CalcV3PriceNormalized. V2 has no
-		// sqrtPriceX96, so instead we use whichever side of this swap is
-		// non-zero on both amount0/amount1 to derive a fixed-direction ratio:
-		// amount0 and amount1 here represent the *same* swap's two legs
-		// (one in, one out), so token1Amount/token0Amount is well-defined
-		// regardless of which leg was "in" vs "out".
-		var amount0, amount1 *big.Int
-		if token0IsIn {
-			amount0, amount1 = amountIn, amountOut
-		} else {
-			amount0, amount1 = amountOut, amountIn
-		}
-		price = dex.CalcPriceNormalized(amount0, decimals0, amount1, decimals1)
-
 		var tokenIn, tokenOut string
 		if token0IsIn {
 			tokenIn, tokenOut = pm.token0, pm.token1
 		} else {
 			tokenIn, tokenOut = pm.token1, pm.token0
 		}
-		decimalsIn := decimals0
-		if !token0IsIn {
-			decimalsIn = decimals1
-		}
-		value = dex.CalcValueNormalized(amountIn, decimalsIn, price)
 		side = u.determineSide(tokenIn, tokenOut)
-	} else {
-		price = dex.CalcPrice(amountIn, amountOut)
-		value = dex.CalcValue(amountIn, price)
 	}
 
 	return &model.Transaction{
@@ -765,31 +752,16 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 	}
 
 	poolAddr := log.Address.Hex()
-	var price, value float64
+
+	// Price/Value always computed from raw sqrtPriceX96/amounts — see
+	// parseV2Swap's doc comment on why (no decimals lookup, no
+	// normalization, regardless of whether this pool's tokens are known).
+	price := dex.CalcV3Price(sqrtPriceX96)
+	value := dex.CalcValue(amountIn, price)
+
+	// Side classification doesn't need decimals — see parseV2Swap.
 	side := "swap"
 	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
-		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
-		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
-
-		// price is always token1/token0, independent of buy/sell direction.
-		// Deriving price from amountIn/amountOut instead would flip depending
-		// on trade direction, producing reciprocal values for buys vs sells
-		// (e.g. 1.57e-9 vs 6.34e8 for the same pool) — that bug is why this
-		// uses sqrtPriceX96 directly rather than the swap's relative amounts.
-		price = dex.CalcV3PriceNormalized(sqrtPriceX96, decimals0, decimals1)
-
-		// value is expressed in token0 terms for every swap, regardless of
-		// which side the user paid in, so volumes aggregate consistently:
-		//   token0 paid  -> value = amount0 (already in token0)
-		//   token1 paid  -> value = amount1 / price (convert token1 -> token0)
-		amount0Norm := dex.NormalizeAmount(new(big.Int).Abs(amount0), decimals0)
-		amount1Norm := dex.NormalizeAmount(new(big.Int).Abs(amount1), decimals1)
-		if token0IsIn {
-			value = amount0Norm
-		} else if price > 0 {
-			value = amount1Norm / price
-		}
-
 		var tokenIn, tokenOut string
 		if token0IsIn {
 			tokenIn, tokenOut = pm.token0, pm.token1
@@ -797,9 +769,6 @@ func (u *UniswapExtractor) parseV3Swap(ctx context.Context, log *ethtypes.Log, t
 			tokenIn, tokenOut = pm.token1, pm.token0
 		}
 		side = u.determineSide(tokenIn, tokenOut)
-	} else {
-		price = dex.CalcV3Price(sqrtPriceX96)
-		value = dex.CalcValue(amountIn, price)
 	}
 
 	return &model.Transaction{
@@ -902,7 +871,7 @@ func (u *UniswapExtractor) parseSync(ctx context.Context, log *ethtypes.Log, tx 
 	reserve1 := new(big.Int).SetBytes(log.Data[32:64])
 
 	poolAddr := log.Address.Hex()
-	reserve := &model.Reserve{
+	return &model.Reserve{
 		Addr:     poolAddr,
 		Protocol: "uniswap_v2",
 		Amounts: map[int]*big.Int{
@@ -911,22 +880,6 @@ func (u *UniswapExtractor) parseSync(ctx context.Context, log *ethtypes.Log, tx 
 		},
 		Time: uint64(tx.Timestamp.Unix()),
 	}
-
-	// Normalize into human-readable units when token decimals are already
-	// known (from a scanned PairCreated event or the startup warmup cache).
-	// resolvePoolTokens only checks the cache here — it does not issue
-	// eth_call — so this never blocks the hot path; pools not yet known
-	// simply get Value left unset, same as before this normalization existed.
-	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
-		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
-		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
-		reserve.Value = map[int]float64{
-			0: dex.NormalizeAmount(reserve0, decimals0),
-			1: dex.NormalizeAmount(reserve1, decimals1),
-		}
-	}
-
-	return reserve
 }
 
 // parseV3Reserve derives virtual reserves at the current price from a V3 Swap event.
@@ -962,7 +915,7 @@ func (u *UniswapExtractor) parseV3Reserve(ctx context.Context, log *ethtypes.Log
 	amount1.Rsh(amount1, 96)
 
 	poolAddr := log.Address.Hex()
-	reserve := &model.Reserve{
+	return &model.Reserve{
 		Addr:     poolAddr,
 		Protocol: "uniswap_v3",
 		Amounts: map[int]*big.Int{
@@ -971,19 +924,6 @@ func (u *UniswapExtractor) parseV3Reserve(ctx context.Context, log *ethtypes.Log
 		},
 		Time: uint64(tx.Timestamp.Unix()),
 	}
-
-	// Normalize when token decimals are already cached (see parseSync for
-	// why this is cache-only and never blocks on eth_call).
-	if pm := u.resolvePoolTokens(ctx, poolAddr); pm != nil {
-		decimals0 := u.fetchTokenMeta(ctx, pm.token0).Decimals
-		decimals1 := u.fetchTokenMeta(ctx, pm.token1).Decimals
-		reserve.Value = map[int]float64{
-			0: dex.NormalizeAmount(amount0, decimals0),
-			1: dex.NormalizeAmount(amount1, decimals1),
-		}
-	}
-
-	return reserve
 }
 
 // parseV2PairCreated parses PairCreated(address indexed token0, address indexed token1, address pair, uint256)
